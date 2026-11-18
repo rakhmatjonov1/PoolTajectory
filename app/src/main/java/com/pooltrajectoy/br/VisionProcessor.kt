@@ -1,9 +1,8 @@
 package com.pooltrajectory.br
 
 import org.opencv.core.Core
-import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.Point
+import org.opencv.core.MatOfPoint
 import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
@@ -12,6 +11,7 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 data class BallPoint(val x: Float, val y: Float, val radius: Float, val cue: Boolean)
 data class Segment(val x1: Float, val y1: Float, val x2: Float, val y2: Float, val dashed: Boolean = false)
@@ -32,24 +32,39 @@ class VisionProcessor {
         if (rgba.empty() || rgba.cols() < 10 || rgba.rows() < 10) {
             return AnalysisResult(null, emptyList(), emptyList(), null, null, "Нет кадра")
         }
+
         val bgr = Mat()
         val hsv = Mat()
         val mask = Mat()
+        val green = Mat()
+        val blue = Mat()
+        var kernel: Mat? = null
+        var roi: Mat? = null
+        val roiGray = Mat()
+        val roiHsv = Mat()
+        var maskRoi: Mat? = null
+        val inverse = Mat()
+        val circles = Mat()
+
         try {
             Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
             Imgproc.cvtColor(bgr, hsv, Imgproc.COLOR_BGR2HSV)
 
-            val green = Mat()
-            val blue = Mat()
             Core.inRange(hsv, Scalar(30.0, 35.0, 35.0), Scalar(95.0, 255.0, 255.0), green)
             Core.inRange(hsv, Scalar(85.0, 45.0, 35.0), Scalar(135.0, 255.0, 255.0), blue)
             Core.bitwise_or(green, blue, mask)
-            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(7.0, 7.0))
+
+            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(7.0, 7.0))
             Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, kernel)
             Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_OPEN, kernel)
 
-            val contours = ArrayList<org.opencv.core.MatOfPoint>()
-            Imgproc.findContours(mask.clone(), contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            val contours = ArrayList<MatOfPoint>()
+            val hierarchy = Mat()
+            val maskClone = mask.clone()
+            Imgproc.findContours(maskClone, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            maskClone.release()
+            hierarchy.release()
+
             val minArea = rgba.cols().toDouble() * rgba.rows() * 0.10
             var table: Rect? = null
             var largest = 0.0
@@ -63,21 +78,18 @@ class VisionProcessor {
                 }
                 contour.release()
             }
+
             if (table == null) {
-                releaseAll(bgr, hsv, mask, green, blue)
                 return AnalysisResult(null, emptyList(), emptyList(), null, null, "Стол не найден")
             }
 
-            val roi = Mat(bgr, table)
-            val roiGray = Mat()
-            val roiHsv = Mat()
-            val inverse = Mat()
+            roi = Mat(bgr, table)
             Imgproc.cvtColor(roi, roiGray, Imgproc.COLOR_BGR2GRAY)
             Imgproc.cvtColor(roi, roiHsv, Imgproc.COLOR_BGR2HSV)
-            Core.bitwise_not(Mat(mask, table), inverse)
+            maskRoi = Mat(mask, table)
+            Core.bitwise_not(maskRoi, inverse)
             Imgproc.GaussianBlur(roiGray, roiGray, Size(5.0, 5.0), 1.2)
 
-            val circles = Mat()
             Imgproc.HoughCircles(
                 roiGray, circles, Imgproc.HOUGH_GRADIENT, 1.2,
                 22.0, 100.0, 23.0, 9, 20
@@ -103,13 +115,14 @@ class VisionProcessor {
                 val colorRoi = roiHsv.submat(Rect(x0, y0, x1 - x0, y1 - y0))
                 val mean = Core.mean(colorRoi)
                 colorRoi.release()
+
                 val isCue = mean.`val`[1] < 75.0 && mean.`val`[2] > 165.0
                 found.add(BallPoint((x + table.x).toFloat(), (y + table.y).toFloat(), r.toFloat(), isCue))
             }
 
             val cue = found.firstOrNull { it.cue }
             val objects = found.filterNot { it.cue }
-            val aim = if (cue != null) detectAimLine(roi, cue.x - table.x, cue.y - table.y, table.x, table.y) else null
+            val aim = if (cue != null) detectAimLine(roi, cue.x - table.x, cue.y - table.y) else null
 
             var trajectory = emptyList<Segment>()
             var ghost: BallPoint? = null
@@ -124,13 +137,6 @@ class VisionProcessor {
                 targetVector = physics.third
             }
 
-            roi.release()
-            roiGray.release()
-            roiHsv.release()
-            inverse.release()
-            circles.release()
-            releaseAll(bgr, hsv, mask, green, blue)
-
             val status = when {
                 cue == null -> "Биток не найден"
                 aim == null -> "Линия прицеливания не найдена"
@@ -138,13 +144,14 @@ class VisionProcessor {
             }
             return AnalysisResult(table, found, trajectory, ghost, targetVector, status)
         } catch (e: Exception) {
-            releaseAll(bgr, hsv, mask)
             return AnalysisResult(null, emptyList(), emptyList(), null, null, "Ошибка анализа кадра")
+        } finally {
+            releaseAll(bgr, hsv, mask, green, blue, kernel, roi, roiGray, roiHsv, maskRoi, inverse, circles)
         }
     }
 
     private fun detectAimLine(
-        roi: Mat, cueX: Double, cueY: Double, offsetX: Int, offsetY: Int
+        roi: Mat, cueX: Double, cueY: Double
     ): Pair<Double, Double>? {
         val gray = Mat()
         val edges = Mat()
@@ -153,6 +160,7 @@ class VisionProcessor {
             Imgproc.cvtColor(roi, gray, Imgproc.COLOR_BGR2GRAY)
             Imgproc.Canny(gray, edges, 45.0, 130.0)
             Imgproc.HoughLinesP(edges, lines, 1.0, Math.PI / 180.0, 30, 18.0, 12.0)
+
             var best: Pair<Double, Double>? = null
             var bestLength = 0.0
             for (i in 0 until lines.rows()) {
@@ -162,15 +170,15 @@ class VisionProcessor {
                 val dy = y2 - y1
                 val length = hypot(dx, dy)
                 if (length < 18.0) continue
+
                 val cross = abs((cueX - x1) * dy - (cueY - y1) * dx) / max(0.001, length)
                 if (cross > 5.0 || length <= bestLength) continue
+
                 val ux = dx / length
                 val uy = dy / length
-                val dot = (cueX - x1) * ux + (cueY - y1) * uy
-                // Выбираем направление от битка к более удаленному концу отрезка.
                 val dist1 = hypot(cueX - x1, cueY - y1)
                 val dist2 = hypot(cueX - x2, cueY - y2)
-                val sign = if (dist1 > dist2) 1.0 else -1.0
+                val sign = if (dist1 > dist2) -1.0 else 1.0
                 best = Pair(ux * sign, uy * sign)
                 bestLength = length
             }
@@ -178,7 +186,7 @@ class VisionProcessor {
         } catch (_: Exception) {
             null
         } finally {
-            gray.release(); edges.release(); lines.release()
+            releaseAll(gray, edges, lines)
         }
     }
 
@@ -199,16 +207,18 @@ class VisionProcessor {
         var y = startY
         var dx = dx0
         var dy = dy0
-        var bounceCount = 0
-        repeat(maxBounces + 1) {
+
+        for (bounceCount in 0..maxBounces) {
             val inset = ballRadius
             val left = table.x + inset
             val right = table.x + table.width - inset
             val top = table.y + inset
             val bottom = table.y + table.height - inset
+
             var wallT = Double.POSITIVE_INFINITY
             var nx = 0.0
             var ny = 0.0
+
             if (dx < -1e-8) {
                 val t = (left - x) / dx
                 if (t > 0.001 && t < wallT) { wallT = t; nx = 1.0; ny = 0.0 }
@@ -216,6 +226,7 @@ class VisionProcessor {
                 val t = (right - x) / dx
                 if (t > 0.001 && t < wallT) { wallT = t; nx = -1.0; ny = 0.0 }
             }
+
             if (dy < -1e-8) {
                 val t = (top - y) / dy
                 if (t > 0.001 && t < wallT) { wallT = t; nx = 0.0; ny = 1.0 }
@@ -233,19 +244,24 @@ class VisionProcessor {
                 val c = ox * ox + oy * oy - (2.0 * ballRadius) * (2.0 * ballRadius)
                 val disc = b * b - 4.0 * c
                 if (disc < 0.0) continue
-                val t = (-b - kotlin.math.sqrt(disc)) / 2.0
-                if (t > 0.001 && t < ballT) { ballT = t; hitBall = ball }
+                val t = (-b - sqrt(disc)) / 2.0
+                if (t > 0.001 && t < ballT) {
+                    ballT = t
+                    hitBall = ball
+                }
             }
 
             if (hitBall != null && ballT < wallT) {
                 val hx = x + dx * ballT
                 val hy = y + dy * ballT
                 segments.add(Segment(x.toFloat(), y.toFloat(), hx.toFloat(), hy.toFloat()))
+
                 val nxLine = (hitBall.x - hx).toDouble()
                 val nyLine = (hitBall.y - hy).toDouble()
                 val nLen = hypot(nxLine, nyLine).coerceAtLeast(0.001)
                 val tx = nxLine / nLen
                 val ty = nyLine / nLen
+
                 val ghost = BallPoint(hx.toFloat(), hy.toFloat(), ballRadius.toFloat(), true)
                 val vector = Segment(
                     hitBall.x, hitBall.y,
@@ -256,23 +272,32 @@ class VisionProcessor {
             }
 
             if (!wallT.isFinite()) break
+
             val hx = x + dx * wallT
             val hy = y + dy * wallT
             segments.add(Segment(x.toFloat(), y.toFloat(), hx.toFloat(), hy.toFloat(), bounceCount > 0))
+
             if (bounceCount >= maxBounces) break
+
             val dot = dx * nx + dy * ny
             dx -= 2.0 * dot * nx
             dy -= 2.0 * dot * ny
             val length = hypot(dx, dy).coerceAtLeast(0.001)
-            dx /= length; dy /= length
+            dx /= length
+            dy /= length
             x = hx + dx * 0.5
             y = hy + dy * 0.5
-            bounceCount++
         }
+
         return Triple(segments, null, null)
     }
 
-    private fun releaseAll(vararg mats: Mat) {
-        mats.forEach { try { it.release() } catch (_: Exception) {} }
+    private fun releaseAll(vararg mats: Mat?) {
+        mats.forEach {
+            try {
+                it?.release()
+            } catch (_: Exception) {
+            }
+        }
     }
 }
