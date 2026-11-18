@@ -531,7 +531,7 @@ class CaptureService : Service() {
                 val cy = height / 2f
                 canvas.drawCircle(cx, cy, width / 2f - dp(2), outerRing)
                 canvas.drawCircle(cx, cy, dp(12).toFloat(), stroke)
-                canvas.drawCircle(cx, cy, dp(3.5f).toFloat(), centerDot)
+                canvas.drawCircle(cx, cy, dp(4).toFloat(), centerDot)
             }
         }
     }
