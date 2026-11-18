@@ -7,6 +7,8 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -35,9 +37,11 @@ import androidx.core.app.NotificationCompat
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Mat
+import org.opencv.core.Rect
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
+import kotlin.math.hypot
 
 class CaptureService : Service() {
     companion object {
@@ -62,8 +66,15 @@ class CaptureService : Service() {
     private var menuParams: WindowManager.LayoutParams? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
 
+    // Ручные перетаскиваемые маркеры (Биток и Прицел)
+    private var cueHandleView: View? = null
+    private var aimHandleView: View? = null
+    private var cueHandleParams: WindowManager.LayoutParams? = null
+    private var aimHandleParams: WindowManager.LayoutParams? = null
+
     private var statusTextView: TextView? = null
     private var isMenuOpen = false
+    @Volatile private var manualMode = false
 
     private var screenWidth = 0
     private var screenHeight = 0
@@ -86,7 +97,15 @@ class CaptureService : Service() {
     private fun startCapture(intent: Intent) {
         try {
             createNotificationChannel()
-            startForeground(NOTIFICATION_ID, buildNotification())
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification())
+            }
 
             if (!OpenCVLoader.initLocal()) {
                 stopSelf()
@@ -104,36 +123,92 @@ class CaptureService : Service() {
                 return
             }
 
+            windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            updateDisplayMetrics()
+
             val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projection = manager.getMediaProjection(resultCode, resultData)
-
-            val metrics = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(metrics)
-            screenWidth = metrics.widthPixels
-            screenHeight = metrics.heightPixels
-            screenDensity = metrics.densityDpi
 
             workerThread = HandlerThread("PoolTrajectoryCV").also { it.start() }
             workerHandler = Handler(workerThread!!.looper)
 
+            // Android 14+: колбэк обязательно регистрируется ДО createVirtualDisplay
+            projection?.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    stopCapture()
+                }
+            }, workerHandler)
+
             setupOverlay()
             setupFloatingControls()
-            setupProjection()
-        } catch (e: SecurityException) {
-            stopCapture()
-        } catch (e: Exception) {
+            setupManualHandles()
+            createOrResizeProjection()
+        } catch (_: Exception) {
             stopCapture()
         }
     }
 
-    private fun setupProjection() {
+    private fun updateDisplayMetrics() {
+        val wm = windowManager ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            screenWidth = bounds.width()
+            screenHeight = bounds.height()
+            screenDensity = resources.displayMetrics.densityDpi
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(metrics)
+            screenWidth = metrics.widthPixels
+            screenHeight = metrics.heightPixels
+            screenDensity = metrics.densityDpi
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val oldW = screenWidth
+        val oldH = screenHeight
+        updateDisplayMetrics()
+        if (oldW != screenWidth || oldH != screenHeight) {
+            // При повороте экрана (Портрет <-> Альбом) пересоздаём VirtualDisplay под новые размеры
+            createOrResizeProjection()
+            repositionFloatingElementsAfterRotation()
+        }
+    }
+
+    private fun repositionFloatingElementsAfterRotation() {
+        val bParams = bubbleParams ?: return
+        val bSize = dp(48)
+        bParams.x = bParams.x.coerceIn(0, (screenWidth - bSize).coerceAtLeast(0))
+        bParams.y = bParams.y.coerceIn(0, (screenHeight - bSize).coerceAtLeast(0))
+        try { windowManager?.updateViewLayout(bubbleView, bParams) } catch (_: Exception) {}
+        if (isMenuOpen) updateMenuPosition()
+
+        if (manualMode) {
+            resetManualHandlesToCenter()
+            recalculateManualTrajectory()
+        }
+    }
+
+    private fun createOrResizeProjection() {
+        val proj = projection ?: return
         val width = screenWidth.coerceAtLeast(1)
         val height = screenHeight.coerceAtLeast(1)
+
+        try { virtualDisplay?.release() } catch (_: Exception) {}
+        try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         imageReader?.setOnImageAvailableListener({ reader ->
+            if (manualMode) {
+                try { reader.acquireLatestImage()?.close() } catch (_: Exception) {}
+                return@setOnImageAvailableListener
+            }
+
             val now = System.currentTimeMillis()
-            if (now - lastFrameTime < 90 || !processing.compareAndSet(false, true)) {
+            if (now - lastFrameTime < 75 || !processing.compareAndSet(false, true)) {
                 try { reader.acquireLatestImage()?.close() } catch (_: Exception) {}
                 return@setOnImageAvailableListener
             }
@@ -148,9 +223,11 @@ class CaptureService : Service() {
                         Utils.bitmapToMat(bitmap, mat)
                         val result = vision.analyze(mat)
                         overlayView?.post {
-                            overlayView?.setAnalysis(result)
-                            if (isMenuOpen) {
-                                statusTextView?.text = "Статус: ${result.status}"
+                            if (!manualMode) {
+                                overlayView?.setAnalysis(result)
+                                if (isMenuOpen) {
+                                    statusTextView?.text = "Статус: ${result.status}"
+                                }
                             }
                         }
                         mat.release()
@@ -164,11 +241,7 @@ class CaptureService : Service() {
             }
         }, workerHandler)
 
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stopCapture() }
-        }, workerHandler)
-
-        virtualDisplay = projection?.createVirtualDisplay(
+        virtualDisplay = proj.createVirtualDisplay(
             "PoolTrajectoryDisplay",
             width,
             height,
@@ -207,7 +280,6 @@ class CaptureService : Service() {
     }
 
     private fun setupOverlay() {
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         overlayView = TrajectoryOverlayView(this)
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -218,8 +290,181 @@ class CaptureService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START }
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
         windowManager?.addView(overlayView, params)
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupManualHandles() {
+        val handleSize = dp(40)
+
+        cueHandleParams = WindowManager.LayoutParams(
+            handleSize, handleSize, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+
+        aimHandleParams = WindowManager.LayoutParams(
+            handleSize, handleSize, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+
+        cueHandleView = createHandleCircle("#FFFFFF", "#00E5FF")
+        aimHandleView = createHandleCircle("#00E5FF", "#FFFFFF")
+
+        attachHandleDrag(cueHandleView!!, cueHandleParams!!, handleSize)
+        attachHandleDrag(aimHandleView!!, aimHandleParams!!, handleSize)
+    }
+
+    private fun createHandleCircle(fillHex: String, strokeHex: String): View {
+        return object : View(this) {
+            private val outerRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(65, 0, 229, 255)
+                style = Paint.Style.FILL
+            }
+            private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor(strokeHex)
+                style = Paint.Style.STROKE
+                strokeWidth = dp(2).toFloat()
+            }
+            private val centerDot = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor(fillHex)
+                style = Paint.Style.FILL
+            }
+
+            override fun onDraw(canvas: Canvas) {
+                val cx = width / 2f
+                val cy = height / 2f
+                canvas.drawCircle(cx, cy, width / 2f - dp(2), outerRing)
+                canvas.drawCircle(cx, cy, dp(11).toFloat(), stroke)
+                canvas.drawCircle(cx, cy, dp(4).toFloat(), centerDot)
+            }
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun attachHandleDrag(view: View, params: WindowManager.LayoutParams, size: Int) {
+        var initX = 0
+        var initY = 0
+        var touchX = 0f
+        var touchY = 0f
+
+        view.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initX = params.x
+                    initY = params.y
+                    touchX = event.rawX
+                    touchY = event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    params.x = (initX + (event.rawX - touchX).toInt()).coerceIn(0, (screenWidth - size).coerceAtLeast(0))
+                    params.y = (initY + (event.rawY - touchY).toInt()).coerceIn(0, (screenHeight - size).coerceAtLeast(0))
+                    try { windowManager?.updateViewLayout(view, params) } catch (_: Exception) {}
+                    recalculateManualTrajectory()
+                    true
+                }
+                else -> true
+            }
+        }
+    }
+
+    private fun setManualModeEnabled(enabled: Boolean) {
+        manualMode = enabled
+        val wm = windowManager ?: return
+        if (enabled) {
+            resetManualHandlesToCenter()
+            try {
+                wm.addView(cueHandleView, cueHandleParams)
+                wm.addView(aimHandleView, aimHandleParams)
+            } catch (_: Exception) {}
+            recalculateManualTrajectory()
+            statusTextView?.text = "Статус: Ручной прицел (60 FPS)"
+        } else {
+            try { wm.removeView(cueHandleView) } catch (_: Exception) {}
+            try { wm.removeView(aimHandleView) } catch (_: Exception) {}
+            statusTextView?.text = "Статус: Поиск стола..."
+        }
+    }
+
+    private fun resetManualHandlesToCenter() {
+        val half = dp(20)
+        val table = vision.lastDetectedTable
+        if (table != null && table.width > 100 && table.height > 80) {
+            cueHandleParams?.x = (table.x + table.width / 3) - half
+            cueHandleParams?.y = (table.y + table.height / 2) - half
+            aimHandleParams?.x = (table.x + (table.width * 2) / 3) - half
+            aimHandleParams?.y = (table.y + table.height / 3) - half
+        } else {
+            cueHandleParams?.x = (screenWidth / 3) - half
+            cueHandleParams?.y = (screenHeight / 2) - half
+            aimHandleParams?.x = ((screenWidth * 2) / 3) - half
+            aimHandleParams?.y = (screenHeight / 2) - half
+        }
+        try {
+            windowManager?.updateViewLayout(cueHandleView, cueHandleParams)
+            windowManager?.updateViewLayout(aimHandleView, aimHandleParams)
+        } catch (_: Exception) {}
+    }
+
+    private fun recalculateManualTrajectory() {
+        val cParams = cueHandleParams ?: return
+        val aParams = aimHandleParams ?: return
+        val half = dp(20)
+
+        val cueX = (cParams.x + half).toDouble()
+        val cueY = (cParams.y + half).toDouble()
+        val aimX = (aParams.x + half).toDouble()
+        val aimY = (aParams.y + half).toDouble()
+
+        val vx = aimX - cueX
+        val vy = aimY - cueY
+        val len = hypot(vx, vy).coerceAtLeast(0.001)
+        val dx = vx / len
+        val dy = vy / len
+
+        // Используем границы стола от OpenCV, если стол найден, иначе стандартные пропорции игрового поля
+        val table = vision.lastDetectedTable ?: Rect(
+            (screenWidth * 0.16).toInt(),
+            (screenHeight * 0.18).toInt(),
+            (screenWidth * 0.68).toInt(),
+            (screenHeight * 0.68).toInt()
+        )
+        val ballRadius = (table.width / 38.0).coerceIn(10.0, 32.0)
+
+        val physics = vision.tracePhysics(
+            cueX, cueY, dx, dy,
+            vision.lastDetectedBalls.filterNot { it.cue },
+            table,
+            ballRadius
+        )
+        overlayView?.setAnalysis(
+            AnalysisResult(
+                table = table,
+                balls = emptyList(),
+                trajectory = physics.first,
+                ghost = physics.second,
+                targetVector = physics.third,
+                status = "Ручной режим"
+            )
+        )
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -235,7 +480,10 @@ class CaptureService : Service() {
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = dp(16)
-            y = dp(140)
+            y = dp(90)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
         }
 
         bubbleView = object : View(this) {
@@ -315,7 +563,7 @@ class CaptureService : Service() {
             setPadding(dp(14), dp(12), dp(14), dp(14))
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
-                setColor(Color.parseColor("#F00E1420"))
+                setColor(Color.parseColor("#F20E1420"))
                 setStroke(dp(1), Color.parseColor("#00E5FF"))
                 cornerRadius = dp(14).toFloat()
             }
@@ -327,7 +575,7 @@ class CaptureService : Service() {
         }
 
         val headerText = TextView(this).apply {
-            text = "TRAJECTORY HUD"
+            text = "SMART HUD"
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.parseColor("#00E5FF"))
@@ -348,10 +596,16 @@ class CaptureService : Service() {
         topRow.addView(closeBtn)
 
         statusTextView = TextView(this).apply {
-            text = "Статус: Ожидание"
+            text = "Статус: Авто-поиск"
             textSize = 11f
             setTextColor(Color.parseColor("#94A3B8"))
             setPadding(0, dp(2), 0, dp(10))
+        }
+
+        // Переключатель режима: АВТО (OpenCV) / РУЧНОЙ (Маркеры)
+        val modeBtn = createMiniToggle("Режим: АВТО (OpenCV)", true) { view, isAuto ->
+            setManualModeEnabled(!isAuto)
+            view.text = if (isAuto) "Режим: АВТО (OpenCV)" else "Режим: РУЧНОЙ (Маркеры)"
         }
 
         val toggleOverlayBtn = createMiniToggle("Оверлей: ВКЛ", true) { view, active ->
@@ -360,10 +614,10 @@ class CaptureService : Service() {
             view.text = if (active) "Оверлей: ВКЛ" else "Оверлей: ВЫКЛ"
         }
 
-        val toggleBoxesBtn = createMiniToggle("Контуры шаров: ВКЛ", true) { view, active ->
+        val toggleBoxesBtn = createMiniToggle("Контуры стола: ВКЛ", true) { view, active ->
             overlayView?.showTableAndBalls = active
             overlayView?.postInvalidate()
-            view.text = if (active) "Контуры шаров: ВКЛ" else "Контуры шаров: ВЫКЛ"
+            view.text = if (active) "Контуры стола: ВКЛ" else "Контуры стола: ВЫКЛ"
         }
 
         val bouncesBtn = createMiniChip("Отскоки от борта: 2") { view ->
@@ -374,6 +628,7 @@ class CaptureService : Service() {
             }
             vision.maxBounces = next
             view.text = "Отскоки от борта: $next"
+            if (manualMode) recalculateManualTrajectory()
         }
 
         val widthBtn = createMiniChip("Толщина луча: Средняя") { view ->
@@ -410,6 +665,7 @@ class CaptureService : Service() {
 
         card.addView(topRow)
         card.addView(statusTextView)
+        card.addView(modeBtn)
         card.addView(toggleOverlayBtn)
         card.addView(toggleBoxesBtn)
         card.addView(bouncesBtn)
@@ -418,7 +674,7 @@ class CaptureService : Service() {
 
         menuView = card
         menuParams = WindowManager.LayoutParams(
-            dp(220),
+            dp(225),
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -426,6 +682,9 @@ class CaptureService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
         }
     }
 
@@ -448,14 +707,14 @@ class CaptureService : Service() {
     private fun updateMenuPosition() {
         val bParams = bubbleParams ?: return
         val mParams = menuParams ?: return
-        val menuW = dp(220)
+        val menuW = dp(225)
         val bubbleW = dp(48)
         mParams.x = if (bParams.x + bubbleW + menuW + dp(12) < screenWidth) {
             bParams.x + bubbleW + dp(8)
         } else {
             (bParams.x - menuW - dp(8)).coerceAtLeast(dp(8))
         }
-        mParams.y = bParams.y.coerceIn(dp(16), (screenHeight - dp(260)).coerceAtLeast(dp(16)))
+        mParams.y = bParams.y.coerceIn(dp(12), (screenHeight - dp(290)).coerceAtLeast(dp(12)))
         if (isMenuOpen) {
             try { windowManager?.updateViewLayout(menuView, mParams) } catch (_: Exception) {}
         }
@@ -540,8 +799,8 @@ class CaptureService : Service() {
 
     private fun buildNotification(): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("PoolTrajectory HUD")
-            .setContentText("Плавающая панель управления активна")
+            .setContentTitle("PoolTrajectory Smart HUD")
+            .setContentText("Плавающий оверлей и анализ траекторий активны")
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setOngoing(true)
             .build()
@@ -555,17 +814,15 @@ class CaptureService : Service() {
         imageReader = null
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
-        try {
-            if (isMenuOpen) menuView?.let { windowManager?.removeView(it) }
-        } catch (_: Exception) {}
+        try { if (manualMode) windowManager?.removeView(cueHandleView) } catch (_: Exception) {}
+        try { if (manualMode) windowManager?.removeView(aimHandleView) } catch (_: Exception) {}
+        cueHandleView = null
+        aimHandleView = null
+        try { if (isMenuOpen) menuView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
         menuView = null
-        try {
-            bubbleView?.let { windowManager?.removeView(it) }
-        } catch (_: Exception) {}
+        try { bubbleView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
         bubbleView = null
-        try {
-            overlayView?.let { windowManager?.removeView(it) }
-        } catch (_: Exception) {}
+        try { overlayView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
         overlayView = null
         try { workerThread?.quitSafely() } catch (_: Exception) {}
         workerThread = null
