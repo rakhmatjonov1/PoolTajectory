@@ -839,4 +839,31 @@ class CaptureService : Service() {
     private fun stopCapture() {
         if (!stopping.compareAndSet(false, true)) return
         try { virtualDisplay?.release() } catch (_: Exception) {}
-        virtualDisplay
+        virtualDisplay = null
+        try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+        imageReader = null
+        try { projection?.stop() } catch (_: Exception) {}
+        projection = null
+        try { if (manualMode) windowManager?.removeView(cueHandleView) } catch (_: Exception) {}
+        try { if (manualMode) windowManager?.removeView(aimHandleView) } catch (_: Exception) {}
+        cueHandleView = null
+        aimHandleView = null
+        try { if (isMenuOpen) menuView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
+        menuView = null
+        try { bubbleView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
+        bubbleView = null
+        try { overlayView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
+        overlayView = null
+        try { workerThread?.quitSafely() } catch (_: Exception) {}
+        workerThread = null
+        workerHandler = null
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        stopCapture()
+        super.onDestroy()
+    }
+}
