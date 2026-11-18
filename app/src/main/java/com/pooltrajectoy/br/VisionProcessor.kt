@@ -2,9 +2,7 @@ package com.pooltrajectory.br
 
 import android.graphics.Color
 import org.opencv.core.Core
-import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint
 import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
@@ -14,27 +12,13 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sqrt
-
-enum class BallType(val label: String, val colorInt: Int) {
-    CUE("Биток", Color.WHITE),
-    YELLOW("Жёлтый (1/9)", Color.parseColor("#FFD600")),
-    BLUE("Синий (2/10)", Color.parseColor("#2979FF")),
-    RED("Красный (3/11)", Color.parseColor("#FF1744")),
-    PURPLE("Фиолетовый (4/12)", Color.parseColor("#D500F9")),
-    ORANGE("Оранжевый (5/13)", Color.parseColor("#FF6D00")),
-    GREEN("Зелёный (6/14)", Color.parseColor("#00E676")),
-    MAROON("Бордовый (7/15)", Color.parseColor("#8E0000")),
-    EIGHT("Чёрный (8)", Color.parseColor("#263238")),
-    UNKNOWN("Шар", Color.parseColor("#00E5FF"))
-}
 
 data class BallPoint(
     val x: Float,
     val y: Float,
     val radius: Float,
     val cue: Boolean,
-    val type: BallType = if (cue) BallType.CUE else BallType.UNKNOWN
+    val colorInt: Int = Color.WHITE
 )
 
 data class Segment(
@@ -47,7 +31,7 @@ data class Segment(
 
 data class AnalysisResult(
     val table: Rect?,
-    val balls: List<BallPoint>,
+    val cueBall: BallPoint?,
     val trajectory: List<Segment>,
     val ghost: BallPoint?,
     val targetVector: Segment?,
@@ -57,264 +41,195 @@ data class AnalysisResult(
 
 class VisionProcessor {
     @Volatile var maxBounces = 3
-    @Volatile var cueForceLevel = 7 // Уровень силы кия от 1 до 11
-    @Volatile var lastDetectedTable: Rect? = null
+    @Volatile var cueForceLevel = 7 // 1..11
+    @Volatile var calibratedTableRect: Rect? = null
 
+    /**
+     * Комбинированный конвейер:
+     * 1. Жёсткая геометрия стола (из калибровки или безопасных пропорций).
+     * 2. Вычитание размытого фона (absdiff) — работает на любом цвете стола (синий, зелёный, фиолетовый).
+     * 3. Ray-Cast Vision — поиск препятствий только вдоль луча удара без лишних кругов на столе.
+     */
     fun analyze(rgbaFull: Mat): AnalysisResult {
-        if (rgbaFull.empty() || rgbaFull.cols() < 20 || rgbaFull.rows() < 20) {
-            return AnalysisResult(null, emptyList(), emptyList(), null, null, Color.CYAN, "Нет кадра")
+        if (rgbaFull.empty() || rgbaFull.cols() < 40 || rgbaFull.rows() < 40) {
+            return AnalysisResult(null, null, emptyList(), null, null, Color.CYAN, "Нет кадра")
+        }
+
+        val fullW = rgbaFull.cols()
+        val fullH = rgbaFull.rows()
+        val tableFull = getActiveTableRect(fullW, fullH)
+
+        if (tableFull.width < 100 || tableFull.height < 60) {
+            return AnalysisResult(null, null, emptyList(), null, null, Color.CYAN, "Неверные границы стола")
         }
 
         val scale = 0.5
         val invScale = 1.0 / scale
 
-        val rgba = Mat()
-        val bgr = Mat()
-        val hsv = Mat()
-        val green = Mat()
-        val blue = Mat()
-        val clothMask = Mat()
-        var kernel: Mat? = null
-        var tableHsv: Mat? = null
-        var tableBgr: Mat? = null
-        var tableClothMask: Mat? = null
-        val objectsMask = Mat()
-        val distTransform = Mat()
+        val tableSmall = Rect(
+            (tableFull.x * scale).toInt().coerceIn(0, (fullW * scale).toInt() - 10),
+            (tableFull.y * scale).toInt().coerceIn(0, (fullH * scale).toInt() - 10),
+            (tableFull.width * scale).toInt().coerceAtLeast(20),
+            (tableFull.height * scale).toInt().coerceAtLeast(20)
+        )
+        // Защита от выхода за границы кадра
+        if (tableSmall.x + tableSmall.width > (fullW * scale).toInt()) {
+            tableSmall.width = (fullW * scale).toInt() - tableSmall.x
+        }
+        if (tableSmall.y + tableSmall.height > (fullH * scale).toInt()) {
+            tableSmall.height = (fullH * scale).toInt() - tableSmall.y
+        }
+
+        val rgbaSmall = Mat()
+        val bgrSmall = Mat()
+        var roiBgr: Mat? = null
+        val roiHsv = Mat()
+        val roiGray = Mat()
+        val blurredBg = Mat()
+        val diffMap = Mat()
+        val foregroundMask = Mat()
+        val whiteMask = Mat()
 
         try {
-            Imgproc.resize(rgbaFull, rgba, Size(), scale, scale, Imgproc.INTER_LINEAR)
-            Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
-            Imgproc.cvtColor(bgr, hsv, Imgproc.COLOR_BGR2HSV)
+            Imgproc.resize(rgbaFull, rgbaSmall, Size(), scale, scale, Imgproc.INTER_LINEAR)
+            Imgproc.cvtColor(rgbaSmall, bgrSmall, Imgproc.COLOR_RGBA2BGR)
 
-            // 1. Поиск игрового стола по цвету сукна (зелёное или синее)
-            Core.inRange(hsv, Scalar(35.0, 40.0, 40.0), Scalar(90.0, 255.0, 255.0), green)
-            Core.inRange(hsv, Scalar(92.0, 55.0, 50.0), Scalar(120.0, 255.0, 255.0), blue)
-            Core.bitwise_or(green, blue, clothMask)
+            roiBgr = Mat(bgrSmall, tableSmall)
+            Imgproc.cvtColor(roiBgr, roiHsv, Imgproc.COLOR_BGR2HSV)
+            Imgproc.cvtColor(roiBgr, roiGray, Imgproc.COLOR_BGR2GRAY)
 
-            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(7.0, 7.0))
-            Imgproc.morphologyEx(clothMask, clothMask, Imgproc.MORPH_CLOSE, kernel)
-            Imgproc.morphologyEx(clothMask, clothMask, Imgproc.MORPH_OPEN, kernel)
+            val ballRadiusSmall = (tableSmall.width / 38.0).coerceIn(5.0, 24.0)
 
-            val tableContours = ArrayList<MatOfPoint>()
-            val hierarchy = Mat()
-            val clothClone = clothMask.clone()
-            Imgproc.findContours(clothClone, tableContours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-            clothClone.release()
-            hierarchy.release()
+            // --- ВАРИАНТ 1: Вычитание размытого фона (не зависит от цвета сукна и виньетки) ---
+            val blurSize = (ballRadiusSmall * 3.5).toInt().let { if (it % 2 == 0) it + 1 else it }.coerceIn(15, 61)
+            Imgproc.GaussianBlur(roiBgr, blurredBg, Size(blurSize.toDouble(), blurSize.toDouble()), 0.0)
+            Core.absdiff(roiBgr, blurredBg, diffMap)
 
-            val screenArea = rgba.cols().toDouble() * rgba.rows()
-            val minArea = screenArea * 0.16
-            val maxArea = screenArea * 0.88
+            val diffGray = Mat()
+            Imgproc.cvtColor(diffMap, diffGray, Imgproc.COLOR_BGR2GRAY)
+            // Порог отличия объекта от гладкого фона стола (отсекает водяной знак "8 POOL" и виньетку)
+            Imgproc.threshold(diffGray, foregroundMask, 24.0, 255.0, Imgproc.THRESH_BINARY)
+            diffGray.release()
 
-            var tableSmall: Rect? = null
-            var largest = 0.0
-            for (contour in tableContours) {
-                val area = Imgproc.contourArea(contour)
-                val rect = Imgproc.boundingRect(contour)
-                val ratio = rect.width.toDouble() / max(1, rect.height)
-                if (area in minArea..maxArea && ratio in 1.50..2.50 && area > largest) {
-                    largest = area
-                    tableSmall = rect
-                }
-                contour.release()
-            }
+            val cleanKernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
+            Imgproc.morphologyEx(foregroundMask, foregroundMask, Imgproc.MORPH_OPEN, cleanKernel)
+            cleanKernel.release()
 
-            if (tableSmall == null) {
-                return AnalysisResult(null, emptyList(), emptyList(), null, null, Color.CYAN, "Стол не найден")
-            }
+            // --- Поиск только белого битка ---
+            Core.inRange(roiHsv, Scalar(0.0, 0.0, 185.0), Scalar(180.0, 68.0, 255.0), whiteMask)
+            Core.bitwise_and(whiteMask, foregroundMask, whiteMask)
 
-            // 2. Выделяем все объекты внутри стола, отличающиеся от цвета сукна
-            tableHsv = Mat(hsv, tableSmall)
-            tableBgr = Mat(bgr, tableSmall)
-            tableClothMask = Mat(clothMask, tableSmall)
+            val cueSmall = findBestCueBall(whiteMask, tableSmall.width, tableSmall.height, ballRadiusSmall)
+                ?: return AnalysisResult(tableFull, null, emptyList(), null, null, Color.CYAN, "Ищу белый биток...")
 
-            // Адаптивно определяем точный цвет сукна по центру стола, чтобы отсечь даже водяной знак "8 POOL"
-            val centerSample = tableHsv.submat(
-                Rect(
-                    (tableSmall.width * 0.35).toInt(),
-                    (tableSmall.height * 0.35).toInt(),
-                    (tableSmall.width * 0.30).toInt().coerceAtLeast(4),
-                    (tableSmall.height * 0.30).toInt().coerceAtLeast(4)
-                )
+            val cueFull = BallPoint(
+                x = ((cueSmall.first + tableSmall.x) * invScale).toFloat(),
+                y = ((cueSmall.second + tableSmall.y) * invScale).toFloat(),
+                radius = (ballRadiusSmall * invScale).toFloat(),
+                cue = true,
+                colorInt = Color.WHITE
             )
-            val clothMean = Core.mean(centerSample)
-            centerSample.release()
 
-            val clothH = clothMean.`val`[0]
-            val clothS = clothMean.`val`[1]
-            val clothV = clothMean.`val`[2]
+            // --- Поиск линии прицела в локальном окне вокруг битка ---
+            val aim = detectAimLineNearCue(roiBgr, cueSmall.first, cueSmall.second, ballRadiusSmall)
+                ?: return AnalysisResult(tableFull, cueFull, emptyList(), null, null, Color.CYAN, "Наведите кий на шар")
 
-            val exactClothMask = Mat()
-            Core.inRange(
-                tableHsv,
-                Scalar((clothH - 14.0).coerceAtLeast(0.0), (clothS - 65.0).coerceAtLeast(25.0), (clothV - 65.0).coerceAtLeast(30.0)),
-                Scalar((clothH + 14.0).coerceAtMost(180.0), 255.0, 255.0),
-                exactClothMask
+            // --- ВАРИАНТ 3: Ray-Cast Vision (сканирование препятствий строго вдоль луча) ---
+            val rayResult = traceRayCast(
+                cueSmallX = cueSmall.first,
+                cueSmallY = cueSmall.second,
+                dx0 = aim.first,
+                dy0 = aim.second,
+                tableSmall = tableSmall,
+                ballRadiusSmall = ballRadiusSmall,
+                foregroundMask = foregroundMask,
+                roiHsv = roiHsv,
+                invScale = invScale
             )
-            Core.bitwise_not(exactClothMask, objectsMask)
-            exactClothMask.release()
 
-            // Убираем мелкий шум и тонкую линию разметки дома
-            val openKernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(5.0, 5.0))
-            Imgproc.morphologyEx(objectsMask, objectsMask, Imgproc.MORPH_OPEN, openKernel)
-            openKernel.release()
-
-            val ballRadiusSmall = (tableSmall.width / 38.0).coerceIn(5.0, 22.0)
-
-            // 3. Distance Transform: находит центры каждого шара даже если они стоят вплотную (в пирамиде)
-            Imgproc.distanceTransform(objectsMask, distTransform, Imgproc.DIST_L2, 5)
-
-            val minDist = (ballRadiusSmall * 0.58).toFloat()
-            val maxDist = (ballRadiusSmall * 1.45).toFloat()
-            val step = max(1, (ballRadiusSmall * 0.35).toInt())
-            val minSpacing = ballRadiusSmall * 1.65
-
-            data class Peak(val x: Int, val y: Int, val dist: Float)
-            val peaks = ArrayList<Peak>()
-
-            val rows = distTransform.rows()
-            val cols = distTransform.cols()
-            val rowBuf = FloatArray(cols)
-
-            for (y in step until rows - step step step) {
-                distTransform.get(y, 0, rowBuf)
-                for (x in step until cols - step step step) {
-                    val d = rowBuf[x]
-                    if (d in minDist..maxDist) {
-                        if (!inPocketZone(x.toDouble(), y.toDouble(), cols.toDouble(), rows.toDouble(), ballRadiusSmall)) {
-                            peaks.add(Peak(x, y, d))
-                        }
-                    }
-                }
-            }
-
-            // Сортируем пики от самых уверенных центров к краям и подавляем дубликаты (Non-Maximum Suppression)
-            peaks.sortByDescending { it.dist }
-
-            val foundFull = ArrayList<BallPoint>()
-            val fullR = (ballRadiusSmall * invScale).toFloat()
-
-            for (p in peaks) {
-                val fullX = ((p.x + tableSmall.x) * invScale).toFloat()
-                val fullY = ((p.y + tableSmall.y) * invScale).toFloat()
-                if (foundFull.any { hypot(it.x - fullX, it.y - fullY) < fullR * 1.65 }) continue
-
-                val type = classifyBallColor(tableHsv, p.x, p.y, ballRadiusSmall)
-                // Игнорируем случайные артефакты фона, если цвет не похож ни на один шар
-                if (type == BallType.UNKNOWN) continue
-
-                foundFull.add(
-                    BallPoint(
-                        x = fullX,
-                        y = fullY,
-                        radius = fullR,
-                        cue = (type == BallType.CUE),
-                        type = type
-                    )
-                )
-            }
-
-            // Если нашлось несколько белых кандидатов (например, блик), оставляем только один самый вероятный биток
-            val cueCandidates = foundFull.filter { it.cue }
-            if (cueCandidates.size > 1) {
-                val primaryCue = cueCandidates.first()
-                for (i in foundFull.indices) {
-                    if (foundFull[i].cue && foundFull[i] !== primaryCue) {
-                        foundFull[i] = foundFull[i].copy(cue = false, type = BallType.YELLOW)
-                    }
-                }
-            }
-
-            val tableFull = Rect(
-                (tableSmall.x * invScale).toInt(),
-                (tableSmall.y * invScale).toInt(),
-                (tableSmall.width * invScale).toInt(),
-                (tableSmall.height * invScale).toInt()
-            )
-            val ballRadiusFull = ballRadiusSmall * invScale
-            lastDetectedTable = tableFull
-
-            val cue = foundFull.firstOrNull { it.cue }
-            val objects = foundFull.filterNot { it.cue }
-
-            val aim = if (cue != null) {
-                val cueSmallX = (cue.x * scale) - tableSmall.x
-                val cueSmallY = (cue.y * scale) - tableSmall.y
-                detectAimLineNearCue(tableBgr, cueSmallX, cueSmallY, ballRadiusSmall)
+            val status = if (rayResult.ghost != null) {
+                "Цель захвачена | Сила: $cueForceLevel/11"
             } else {
-                null
+                "Отскоки от бортов | Сила: $cueForceLevel/11"
             }
 
-            var trajectory = emptyList<Segment>()
-            var ghost: BallPoint? = null
-            var targetVector: Segment? = null
-            var hitBallColor = Color.parseColor("#00E5FF")
-
-            if (cue != null && aim != null) {
-                val physics = tracePhysics(
-                    cue.x.toDouble(), cue.y.toDouble(),
-                    aim.first, aim.second,
-                    objects, tableFull, ballRadiusFull
-                )
-                trajectory = physics.first
-                ghost = physics.second
-                targetVector = physics.third
-                hitBallColor = physics.fourth
-            }
-
-            val status = when {
-                cue == null -> "Шаров: ${foundFull.size} | Ищу биток..."
-                aim == null -> "Шаров: ${foundFull.size} | Наведите кий"
-                else -> "Шаров: ${foundFull.size} | Сила: $cueForceLevel/11"
-            }
-            return AnalysisResult(tableFull, foundFull, trajectory, ghost, targetVector, hitBallColor, status)
+            return AnalysisResult(
+                table = tableFull,
+                cueBall = cueFull,
+                trajectory = rayResult.segments,
+                ghost = rayResult.ghost,
+                targetVector = rayResult.targetVector,
+                targetColor = rayResult.targetColor,
+                status = status
+            )
         } catch (_: Exception) {
-            return AnalysisResult(null, emptyList(), emptyList(), null, null, Color.CYAN, "Ошибка кадра")
+            return AnalysisResult(tableFull, null, emptyList(), null, null, Color.CYAN, "Ошибка кадра")
         } finally {
-            releaseAll(rgba, bgr, hsv, green, blue, clothMask, kernel, tableHsv, tableBgr, tableClothMask, objectsMask, distTransform)
+            releaseAll(rgbaSmall, bgrSmall, roiBgr, roiHsv, roiGray, blurredBg, diffMap, foregroundMask, whiteMask)
         }
     }
 
     /**
-     * Определяет цвет и тип шара (1–15 или биток) по центральной зоне шара в HSV
+     * Возвращает откалиброванный прямоугольник стола или стандартные координаты поля в альбомном режиме
      */
-    private fun classifyBallColor(tableHsv: Mat, cx: Int, cy: Int, ballR: Double): BallType {
-        val sampleR = max(2, (ballR * 0.50).toInt())
-        val x0 = (cx - sampleR).coerceIn(0, tableHsv.cols() - 1)
-        val y0 = (cy - sampleR).coerceIn(0, tableHsv.rows() - 1)
-        val x1 = (cx + sampleR + 1).coerceIn(x0 + 1, tableHsv.cols())
-        val y1 = (cy + sampleR + 1).coerceIn(y0 + 1, tableHsv.rows())
-
-        val patch = tableHsv.submat(Rect(x0, y0, x1 - x0, y1 - y0))
-        val mean = Core.mean(patch)
-        patch.release()
-
-        val h = mean.`val`[0]
-        val s = mean.`val`[1]
-        val v = mean.`val`[2]
-
-        // 1. Чёрный шар №8 (очень низкая яркость)
-        if (v < 72.0) return BallType.EIGHT
-
-        // 2. Белый биток (низкая насыщенность, высокая яркость)
-        if (s < 78.0 && v > 165.0) return BallType.CUE
-
-        // Если насыщенность слишком низкая и не белый — это серый блик или тень
-        if (s < 65.0) return BallType.UNKNOWN
-
-        // 3. Цветные шары по оттенку Hue (OpenCV H: 0..180)
-        return when {
-            h in 18.0..34.0 -> BallType.YELLOW      // 1, 9
-            h in 10.0..17.9 -> BallType.ORANGE      // 5, 13
-            h < 10.0 || h > 166.0 -> {
-                if (v < 145.0) BallType.MAROON      // 7, 15 (тёмно-бордовый)
-                else BallType.RED                   // 3, 11 (ярко-красный)
+    fun getActiveTableRect(screenW: Int, screenH: Int): Rect {
+        calibratedTableRect?.let {
+            if (it.width > 120 && it.height > 70 && it.x >= 0 && it.y >= 0 &&
+                it.x + it.width <= screenW && it.y + it.height <= screenH
+            ) {
+                return it
             }
-            h in 38.0..86.0 -> BallType.GREEN       // 6, 14
-            h in 98.0..126.0 -> BallType.BLUE       // 2, 10
-            h in 126.1..165.9 -> BallType.PURPLE    // 4, 12
-            else -> BallType.UNKNOWN
         }
+        // Безопасная геометрия внутреннего поля стола 8 Ball Pool по умолчанию
+        val left = (screenW * 0.172).toInt()
+        val top = (screenH * 0.195).toInt()
+        val right = (screenW * 0.828).toInt()
+        val bottom = (screenH * 0.865).toInt()
+        return Rect(left, top, (right - left).coerceAtLeast(100), (bottom - top).coerceAtLeast(60))
+    }
+
+    /**
+     * Находит центр белого битка по плотности белых пикселей внутри круга радиуса ballR
+     */
+    private fun findBestCueBall(
+        whiteMask: Mat, w: Int, h: Int, ballR: Double
+    ): Pair<Double, Double>? {
+        val integral = Mat()
+        Imgproc.integral(whiteMask, integral, CvType.CV_32S)
+
+        val r = (ballR * 0.85).toInt().coerceAtLeast(3)
+        val boxArea = (2 * r + 1) * (2 * r + 1) * 255.0
+        val step = max(2, (ballR * 0.35).toInt())
+
+        var bestScore = 0.0
+        var bestX = -1.0
+        var bestY = -1.0
+
+        val rowTop = IntArray(w + 1)
+        val rowBot = IntArray(w + 1)
+
+        for (y in r + 2 until h - r - 2 step step) {
+            if (inPocketZone(0.0, y.toDouble(), w.toDouble(), h.toDouble(), ballR)) continue
+            integral.get(y - r, 0, rowTop)
+            integral.get(y + r + 1, 0, rowBot)
+
+            for (x in r + 2 until w - r - 2 step step) {
+                if (inPocketZone(x.toDouble(), y.toDouble(), w.toDouble(), h.toDouble(), ballR)) continue
+
+                val sum = rowBot[x + r + 1] - rowBot[x - r] - rowTop[x + r + 1] + rowTop[x - r]
+                val fillRatio = sum / boxArea
+
+                // Белый биток заполняет от 45% до 92% квадрата (отсекаем слишком большие белые блики и мелкий шум)
+                if (fillRatio in 0.42..0.92 && fillRatio > bestScore) {
+                    bestScore = fillRatio
+                    bestX = x.toDouble()
+                    bestY = y.toDouble()
+                }
+            }
+        }
+        integral.release()
+
+        return if (bestX > 0 && bestY > 0) Pair(bestX, bestY) else null
     }
 
     private fun detectAimLineNearCue(
@@ -373,31 +288,213 @@ class VisionProcessor {
         }
     }
 
+    data class RayCastOutput(
+        val segments: List<Segment>,
+        val ghost: BallPoint?,
+        val targetVector: Segment?,
+        val targetColor: Int
+    )
+
+    /**
+     * Вариант 3: Шагаем вдоль луча прицеливания и проверяем наличие препятствия
+     * в радиусе столкновения (2 * ballRadius) только на пути битка.
+     */
+    private fun traceRayCast(
+        cueSmallX: Double,
+        cueSmallY: Double,
+        dx0: Double,
+        dy0: Double,
+        tableSmall: Rect,
+        ballRadiusSmall: Double,
+        foregroundMask: Mat,
+        roiHsv: Mat,
+        invScale: Double
+    ): RayCastOutput {
+        val segments = ArrayList<Segment>()
+        var x = cueSmallX
+        var y = cueSmallY
+        var dx = dx0
+        var dy = dy0
+
+        val force = cueForceLevel.coerceIn(1, 11)
+        var remainingEnergy = tableSmall.width * (0.35 + force * 0.26)
+        val effectiveBounces = min(maxBounces, (force + 1) / 3)
+
+        val inset = ballRadiusSmall
+        val left = inset
+        val right = tableSmall.width - inset
+        val top = inset
+        val bottom = tableSmall.height - inset
+
+        val stepSize = max(1.5, ballRadiusSmall * 0.25)
+        val checkR = (ballRadiusSmall * 0.65).toInt().coerceAtLeast(2)
+        val patchArea = (2 * checkR + 1) * (2 * checkR + 1)
+        val pixelBuf = ByteArray(1)
+
+        for (bounceCount in 0..effectiveBounces) {
+            if (remainingEnergy <= 4.0) break
+
+            var wallT = Double.POSITIVE_INFINITY
+            var nx = 0.0
+            var ny = 0.0
+
+            if (dx < -1e-8) {
+                val t = (left - x) / dx
+                if (t > 0.001 && t < wallT) { wallT = t; nx = 1.0; ny = 0.0 }
+            } else if (dx > 1e-8) {
+                val t = (right - x) / dx
+                if (t > 0.001 && t < wallT) { wallT = t; nx = -1.0; ny = 0.0 }
+            }
+
+            if (dy < -1e-8) {
+                val t = (top - y) / dy
+                if (t > 0.001 && t < wallT) { wallT = t; nx = 0.0; ny = 1.0 }
+            } else if (dy > 1e-8) {
+                val t = (bottom - y) / dy
+                if (t > 0.001 && t < wallT) { wallT = t; nx = 0.0; ny = -1.0 }
+            }
+
+            if (!wallT.isFinite()) break
+
+            val maxSegmentT = min(wallT, remainingEnergy)
+            // Начинаем сканировать после 2.1 радиуса от стартовой точки, чтобы не задеть сам биток
+            val startScanT = if (bounceCount == 0) ballRadiusSmall * 2.15 else ballRadiusSmall * 0.5
+            var t = startScanT
+
+            while (t < maxSegmentT) {
+                val testX = x + dx * t
+                val testY = y + dy * t
+
+                // Проверяем, не попадает ли точка в зону лузы
+                if (!inPocketZone(testX, testY, tableSmall.width.toDouble(), tableSmall.height.toDouble(), ballRadiusSmall)) {
+                    val ix = testX.toInt()
+                    val iy = testY.toInt()
+                    if (ix in checkR until (foregroundMask.cols() - checkR) &&
+                        iy in checkR until (foregroundMask.rows() - checkR)
+                    ) {
+                        foregroundMask.get(iy, ix, pixelBuf)
+                        if (pixelBuf[0] != 0.toByte()) {
+                            // Проверяем плотность объекта в окрестности, чтобы отсечь тонкую белую линию прицела игры
+                            val sub = foregroundMask.submat(Rect(ix - checkR, iy - checkR, 2 * checkR + 1, 2 * checkR + 1))
+                            val density = Core.countNonZero(sub).toDouble() / patchArea
+                            sub.release()
+
+                            if (density > 0.52) {
+                                // Нашли реальный прицельный шар на пути луча!
+                                // Откатываем центр призрачного шара на 1.85 радиуса назад от точки касания края шара
+                                val ghostSmallX = (testX - dx * (ballRadiusSmall * 0.95))
+                                val ghostSmallY = (testY - dy * (ballRadiusSmall * 0.95))
+                                val targetSmallX = (testX + dx * (ballRadiusSmall * 0.95))
+                                val targetSmallY = (testY + dy * (ballRadiusSmall * 0.95))
+
+                                val fullStartX = ((x + tableSmall.x) * invScale).toFloat()
+                                val fullStartY = ((y + tableSmall.y) * invScale).toFloat()
+                                val fullGhostX = ((ghostSmallX + tableSmall.x) * invScale).toFloat()
+                                val fullGhostY = ((ghostSmallY + tableSmall.y) * invScale).toFloat()
+                                val fullTargetX = ((targetSmallX + tableSmall.x) * invScale).toFloat()
+                                val fullTargetY = ((targetSmallY + tableSmall.y) * invScale).toFloat()
+                                val fullR = (ballRadiusSmall * invScale).toFloat()
+
+                                segments.add(Segment(fullStartX, fullStartY, fullGhostX, fullGhostY, bounceCount > 0))
+
+                                val targetColor = sampleTargetBallColor(roiHsv, targetSmallX.toInt(), targetSmallY.toInt(), ballRadiusSmall)
+                                val energyAfterHit = (remainingEnergy - t).coerceAtLeast(ballRadiusSmall * 3.0)
+                                val targetTravelFull = (energyAfterHit * 0.85 * invScale).coerceIn(fullR * 3.0, tableSmall.width * invScale * 0.95)
+
+                                val ghost = BallPoint(fullGhostX, fullGhostY, fullR, true, Color.WHITE)
+                                val vector = Segment(
+                                    fullTargetX,
+                                    fullTargetY,
+                                    (fullTargetX + dx * targetTravelFull).toFloat(),
+                                    (fullTargetY + dy * targetTravelFull).toFloat()
+                                )
+                                return RayCastOutput(segments, ghost, vector, targetColor)
+                            }
+                        }
+                    }
+                }
+                t += stepSize
+            }
+
+            // Препятствий на отрезке нет — доводим луч до борта или конца энергии
+            val endX = x + dx * maxSegmentT
+            val endY = y + dy * maxSegmentT
+
+            segments.add(
+                Segment(
+                    ((x + tableSmall.x) * invScale).toFloat(),
+                    ((y + tableSmall.y) * invScale).toFloat(),
+                    ((endX + tableSmall.x) * invScale).toFloat(),
+                    ((endY + tableSmall.y) * invScale).toFloat(),
+                    bounceCount > 0
+                )
+            )
+
+            if (wallT > remainingEnergy || bounceCount >= effectiveBounces) break
+
+            remainingEnergy = (remainingEnergy - wallT) * 0.78
+            val dot = dx * nx + dy * ny
+            dx -= 2.0 * dot * nx
+            dy -= 2.0 * dot * ny
+            val length = hypot(dx, dy).coerceAtLeast(0.001)
+            dx /= length
+            dy /= length
+            x = endX + dx * 0.5
+            y = endY + dy * 0.5
+        }
+
+        return RayCastOutput(segments, null, null, Color.parseColor("#00E5FF"))
+    }
+
+    /**
+     * Определяет цвет найденного прицельного шара в точке попадания луча
+     */
+    private fun sampleTargetBallColor(roiHsv: Mat, cx: Int, cy: Int, ballR: Double): Int {
+        val sampleR = max(2, (ballR * 0.45).toInt())
+        val x0 = (cx - sampleR).coerceIn(0, roiHsv.cols() - 1)
+        val y0 = (cy - sampleR).coerceIn(0, roiHsv.rows() - 1)
+        val x1 = (cx + sampleR + 1).coerceIn(x0 + 1, roiHsv.cols())
+        val y1 = (cy + sampleR + 1).coerceIn(y0 + 1, roiHsv.rows())
+
+        val patch = roiHsv.submat(Rect(x0, y0, x1 - x0, y1 - y0))
+        val mean = Core.mean(patch)
+        patch.release()
+
+        val h = mean.`val`[0]
+        val s = mean.`val`[1]
+        val v = mean.`val`[2]
+
+        if (v < 75.0) return Color.parseColor("#B0BEC5") // 8-й шар (подсвечиваем серебристо-белым для контраста)
+        if (s < 70.0) return Color.parseColor("#00E5FF")
+
+        return when {
+            h in 18.0..34.0 -> Color.parseColor("#FFD600")      // Жёлтый (1/9)
+            h in 10.0..17.9 -> Color.parseColor("#FF6D00")      // Оранжевый (5/13)
+            h < 10.0 || h > 166.0 -> Color.parseColor("#FF1744") // Красный/Бордовый (3/11, 7/15)
+            h in 38.0..86.0 -> Color.parseColor("#00E676")      // Зелёный (6/14)
+            h in 98.0..126.0 -> Color.parseColor("#2979FF")     // Синий (2/10)
+            h in 126.1..165.9 -> Color.parseColor("#D500F9")    // Фиолетовый (4/12)
+            else -> Color.parseColor("#00E5FF")
+        }
+    }
+
     private fun inPocketZone(x: Double, y: Double, w: Double, h: Double, ballR: Double): Boolean {
         val pockets = listOf(
             Pair(0.0, 0.0), Pair(w, 0.0), Pair(0.0, h), Pair(w, h),
             Pair(w / 2.0, 0.0), Pair(w / 2.0, h)
         )
-        return pockets.any { hypot(x - it.first, y - it.second) < ballR * 2.0 }
+        return pockets.any { hypot(x - it.first, y - it.second) < ballR * 1.9 }
     }
 
-    data class PhysicsResult(
-        val first: List<Segment>,
-        val second: BallPoint?,
-        val third: Segment?,
-        val fourth: Int
-    )
-
     /**
-     * Физический расчёт траектории с учётом 11 уровней силы кия (cueForceLevel: 1..11)
+     * Упрощённый физический расчёт для ручного режима (маркеры без OpenCV)
      */
-    fun tracePhysics(
+    fun traceManual(
         startX: Double, startY: Double,
         dx0: Double, dy0: Double,
-        balls: List<BallPoint>,
         table: Rect,
         ballRadius: Double
-    ): PhysicsResult {
+    ): List<Segment> {
         val segments = ArrayList<Segment>()
         var x = startX
         var y = startY
@@ -405,9 +502,7 @@ class VisionProcessor {
         var dy = dy0
 
         val force = cueForceLevel.coerceIn(1, 11)
-        // Максимальная дистанция пробега битка зависит от силы кия (от 0.45 ширины стола на силе 1 до 3.2 ширины стола на силе 11)
         var remainingEnergy = table.width * (0.35 + force * 0.26)
-        // Количество отскоков также ограничивается энергией удара
         val effectiveBounces = min(maxBounces, (force + 1) / 3)
 
         for (bounceCount in 0..effectiveBounces) {
@@ -439,56 +534,17 @@ class VisionProcessor {
                 if (t > 0.001 && t < wallT) { wallT = t; nx = 0.0; ny = -1.0 }
             }
 
-            var hitBall: BallPoint? = null
-            var ballT = Double.POSITIVE_INFINITY
-            for (ball in balls) {
-                val ox = x - ball.x
-                val oy = y - ball.y
-                val b = 2.0 * (ox * dx + oy * dy)
-                val c = ox * ox + oy * oy - (2.0 * ballRadius) * (2.0 * ballRadius)
-                val disc = b * b - 4.0 * c
-                if (disc < 0.0) continue
-                val t = (-b - sqrt(disc)) / 2.0
-                if (t > 0.001 && t < ballT) {
-                    ballT = t
-                    hitBall = ball
-                }
-            }
-
-            // Столкновение с прицельным шаром в пределах оставшейся энергии удара
-            if (hitBall != null && ballT < wallT && ballT <= remainingEnergy) {
-                val hx = x + dx * ballT
-                val hy = y + dy * ballT
-                segments.add(Segment(x.toFloat(), y.toFloat(), hx.toFloat(), hy.toFloat()))
-
-                val energyAfterHit = (remainingEnergy - ballT).coerceAtLeast(ballRadius * 2.0)
-
-                val nxLine = (hitBall.x - hx).toDouble()
-                val nyLine = (hitBall.y - hy).toDouble()
-                val nLen = hypot(nxLine, nyLine).coerceAtLeast(0.001)
-                val tx = nxLine / nLen
-                val ty = nyLine / nLen
-
-                // Угол резки влияет на передачу импульса прицельному шару
-                val cutFactor = (dx * tx + dy * ty).coerceIn(0.15, 1.0)
-                val targetTravel = (energyAfterHit * cutFactor * 0.85).coerceIn(ballRadius * 2.5, table.width * 1.1)
-
-                val ghost = BallPoint(hx.toFloat(), hy.toFloat(), ballRadius.toFloat(), true)
-                val vector = Segment(
-                    hitBall.x, hitBall.y,
-                    (hitBall.x + tx * targetTravel).toFloat(),
-                    (hitBall.y + ty * targetTravel).toFloat()
-                )
-                return PhysicsResult(segments, ghost, vector, hitBall.type.colorInt)
-            }
-
             if (!wallT.isFinite()) break
 
-            // Если энергии не хватает долететь до борта — заканчиваем луч в точке остановки шара
             if (wallT > remainingEnergy) {
-                val stopX = x + dx * remainingEnergy
-                val stopY = y + dy * remainingEnergy
-                segments.add(Segment(x.toFloat(), y.toFloat(), stopX.toFloat(), stopY.toFloat(), bounceCount > 0))
+                segments.add(
+                    Segment(
+                        x.toFloat(), y.toFloat(),
+                        (x + dx * remainingEnergy).toFloat(),
+                        (y + dy * remainingEnergy).toFloat(),
+                        bounceCount > 0
+                    )
+                )
                 break
             }
 
@@ -496,9 +552,7 @@ class VisionProcessor {
             val hy = y + dy * wallT
             segments.add(Segment(x.toFloat(), y.toFloat(), hx.toFloat(), hy.toFloat(), bounceCount > 0))
 
-            // Потеря энергии на пробег + отскок от резины борта (22%)
             remainingEnergy = (remainingEnergy - wallT) * 0.78
-
             if (bounceCount >= effectiveBounces) break
 
             val dot = dx * nx + dy * ny
@@ -511,7 +565,7 @@ class VisionProcessor {
             y = hy + dy * 0.5
         }
 
-        return PhysicsResult(segments, null, null, Color.parseColor("#00E5FF"))
+        return segments
     }
 
     private fun releaseAll(vararg mats: Mat?) {
