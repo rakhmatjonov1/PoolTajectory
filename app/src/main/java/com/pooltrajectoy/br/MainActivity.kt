@@ -45,14 +45,14 @@ class MainActivity : AppCompatActivity() {
 
         val title = TextView(this).apply {
             text = "POOL TRAJECTORY"
-            textSize = 24f
+            textSize = 23f
             typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
             setTextColor(Color.WHITE)
-            letterSpacing = 0.06f
+            letterSpacing = 0.05f
         }
 
         val versionTag = TextView(this).apply {
-            text = "PRO HUD"
+            text = "SMART HUD"
             textSize = 11f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.parseColor("#00E5FF"))
@@ -61,7 +61,7 @@ class MainActivity : AppCompatActivity() {
             val params = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { marginStart = dp(12) }
+            ).apply { marginStart = dp(10) }
             layoutParams = params
         }
 
@@ -69,10 +69,10 @@ class MainActivity : AppCompatActivity() {
         headerRow.addView(versionTag)
 
         val subtitle = TextView(this).apply {
-            text = "Тактический оверлей для расчёта траекторий и отскоков от бортов в реальном времени."
+            text = "Умный тактический оверлей с авто-распознаванием стола и ручными маркерами прицела."
             textSize = 14f
             setTextColor(Color.parseColor("#8E9BAE"))
-            setPadding(0, dp(8), 0, dp(24))
+            setPadding(0, dp(8), 0, dp(22))
             setLineSpacing(dp(3).toFloat(), 1f)
         }
 
@@ -93,7 +93,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val statusLabel = TextView(this).apply {
-            text = "Поверх других окон"
+            text = "Отображение поверх окон"
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
@@ -110,7 +110,7 @@ class MainActivity : AppCompatActivity() {
         statusHeader.addView(overlayStatusBadge)
 
         val statusDesc = TextView(this).apply {
-            text = "Необходимо для отображения плавающей кнопки управления и линий прицеливания поверх игры."
+            text = "Требуется для плавающей иконки меню и отрисовки линий прицеливания поверх игры."
             textSize = 13f
             setTextColor(Color.parseColor("#7A889B"))
             setPadding(0, dp(8), 0, dp(14))
@@ -136,7 +136,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val controlTitle = TextView(this).apply {
-            text = "Управление оверлеем"
+            text = "Запуск оверлея"
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
@@ -144,7 +144,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val controlDesc = TextView(this).apply {
-            text = "После запуска появится плавающая иконка. Нажмите на неё в игре, чтобы открыть мини-окно настроек."
+            text = "Нажмите на круглый значок прицела в углу экрана, чтобы открыть мини-окно управления (режимы Авто / Ручной, отскоки и толщина луча)."
             textSize = 13f
             setTextColor(Color.parseColor("#7A889B"))
             setPadding(0, 0, 0, dp(16))
@@ -172,7 +172,7 @@ class MainActivity : AppCompatActivity() {
             val intent = Intent(this@MainActivity, CaptureService::class.java)
                 .setAction(CaptureService.ACTION_STOP)
             startService(intent)
-            Toast.makeText(this@MainActivity, "Оверлей остановлен", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@MainActivity, "Сервис остановлен", Toast.LENGTH_SHORT).show()
         }
 
         controlCard.addView(controlTitle)
