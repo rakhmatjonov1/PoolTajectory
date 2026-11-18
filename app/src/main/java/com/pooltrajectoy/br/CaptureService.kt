@@ -46,6 +46,8 @@ import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
 
 class CaptureService : Service() {
     companion object {
@@ -70,14 +72,22 @@ class CaptureService : Service() {
     private var menuParams: WindowManager.LayoutParams? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
 
+    // Маркеры ручного прицела
     private var cueHandleView: View? = null
     private var aimHandleView: View? = null
     private var cueHandleParams: WindowManager.LayoutParams? = null
     private var aimHandleParams: WindowManager.LayoutParams? = null
 
+    // Маркеры калибровки углов стола (Левый-Верхний и Правый-Нижний)
+    private var topLeftCornerView: View? = null
+    private var bottomRightCornerView: View? = null
+    private var topLeftCornerParams: WindowManager.LayoutParams? = null
+    private var bottomRightCornerParams: WindowManager.LayoutParams? = null
+
     private var statusTextView: TextView? = null
     private var isMenuOpen = false
     @Volatile private var manualMode = false
+    @Volatile private var calibrationMode = false
 
     private var screenWidth = 0
     private var screenHeight = 0
@@ -145,6 +155,7 @@ class CaptureService : Service() {
 
             windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
             updateDisplayMetrics()
+            loadSavedCalibration()
 
             val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projection = manager.getMediaProjection(resultCode, resultData)
@@ -161,10 +172,37 @@ class CaptureService : Service() {
             setupOverlay()
             setupFloatingControls()
             setupManualHandles()
+            setupCalibrationHandles()
             createOrResizeProjection()
         } catch (t: Throwable) {
             reportErrorAndStop(t)
         }
+    }
+
+    private fun loadSavedCalibration() {
+        val prefs = getSharedPreferences("table_calibration", Context.MODE_PRIVATE)
+        val keyPrefix = "${screenWidth}x${screenHeight}_"
+        val x = prefs.getInt(keyPrefix + "x", -1)
+        val y = prefs.getInt(keyPrefix + "y", -1)
+        val w = prefs.getInt(keyPrefix + "w", -1)
+        val h = prefs.getInt(keyPrefix + "h", -1)
+        if (x >= 0 && y >= 0 && w > 120 && h > 70) {
+            vision.calibratedTableRect = Rect(x, y, w, h)
+        } else {
+            vision.calibratedTableRect = null
+        }
+    }
+
+    private fun saveCalibration(rect: Rect) {
+        vision.calibratedTableRect = rect
+        val prefs = getSharedPreferences("table_calibration", Context.MODE_PRIVATE)
+        val keyPrefix = "${screenWidth}x${screenHeight}_"
+        prefs.edit()
+            .putInt(keyPrefix + "x", rect.x)
+            .putInt(keyPrefix + "y", rect.y)
+            .putInt(keyPrefix + "w", rect.width)
+            .putInt(keyPrefix + "h", rect.height)
+            .apply()
     }
 
     private fun updateDisplayMetrics() {
@@ -191,6 +229,7 @@ class CaptureService : Service() {
             val oldH = screenHeight
             updateDisplayMetrics()
             if (oldW != screenWidth || oldH != screenHeight) {
+                loadSavedCalibration()
                 createOrResizeProjection()
                 repositionFloatingElementsAfterRotation()
             }
@@ -220,7 +259,7 @@ class CaptureService : Service() {
 
         val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         newReader.setOnImageAvailableListener({ reader ->
-            if (manualMode) {
+            if (manualMode || calibrationMode) {
                 try { reader.acquireLatestImage()?.close() } catch (_: Exception) {}
                 return@setOnImageAvailableListener
             }
@@ -241,7 +280,7 @@ class CaptureService : Service() {
                         Utils.bitmapToMat(bitmap, mat)
                         val result = vision.analyze(mat)
                         overlayView?.post {
-                            if (!manualMode) {
+                            if (!manualMode && !calibrationMode) {
                                 overlayView?.setAnalysis(result)
                                 if (isMenuOpen) {
                                     statusTextView?.text = result.status
@@ -329,6 +368,115 @@ class CaptureService : Service() {
         windowManager?.addView(overlayView, params)
     }
 
+    // --- Калибровка углов стола (Вариант 2) ---
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupCalibrationHandles() {
+        val size = dp(44)
+        topLeftCornerParams = WindowManager.LayoutParams(
+            size, size, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+
+        bottomRightCornerParams = WindowManager.LayoutParams(
+            size, size, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+
+        topLeftCornerView = createHandleCircle("#00E676", "#FFFFFF")
+        bottomRightCornerView = createHandleCircle("#00E676", "#FFFFFF")
+
+        attachCalibrationDrag(topLeftCornerView!!, topLeftCornerParams!!, size)
+        attachCalibrationDrag(bottomRightCornerView!!, bottomRightCornerParams!!, size)
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun attachCalibrationDrag(view: View, params: WindowManager.LayoutParams, size: Int) {
+        var initX = 0
+        var initY = 0
+        var touchX = 0f
+        var touchY = 0f
+
+        view.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initX = params.x
+                    initY = params.y
+                    touchX = event.rawX
+                    touchY = event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    params.x = (initX + (event.rawX - touchX).toInt()).coerceIn(0, (screenWidth - size).coerceAtLeast(0))
+                    params.y = (initY + (event.rawY - touchY).toInt()).coerceIn(0, (screenHeight - size).coerceAtLeast(0))
+                    try { windowManager?.updateViewLayout(view, params) } catch (_: Exception) {}
+                    updateCalibratedRectFromCorners()
+                    true
+                }
+                else -> true
+            }
+        }
+    }
+
+    private fun setCalibrationModeEnabled(enabled: Boolean) {
+        calibrationMode = enabled
+        val wm = windowManager ?: return
+        overlayView?.showTableFrame = enabled
+        if (enabled) {
+            if (manualMode) setManualModeEnabled(false)
+            val half = dp(22)
+            val current = vision.getActiveTableRect(screenWidth, screenHeight)
+            topLeftCornerParams?.x = (current.x - half).coerceAtLeast(0)
+            topLeftCornerParams?.y = (current.y - half).coerceAtLeast(0)
+            bottomRightCornerParams?.x = (current.x + current.width - half).coerceAtMost(screenWidth - dp(44))
+            bottomRightCornerParams?.y = (current.y + current.height - half).coerceAtMost(screenHeight - dp(44))
+            try {
+                wm.addView(topLeftCornerView, topLeftCornerParams)
+                wm.addView(bottomRightCornerView, bottomRightCornerParams)
+            } catch (_: Exception) {}
+            updateCalibratedRectFromCorners()
+            statusTextView?.text = "Выставьте 2 зелёные точки по углам сукна"
+        } else {
+            try { wm.removeView(topLeftCornerView) } catch (_: Exception) {}
+            try { wm.removeView(bottomRightCornerView) } catch (_: Exception) {}
+            overlayView?.postInvalidate()
+            statusTextView?.text = "Границы стола сохранены"
+        }
+    }
+
+    private fun updateCalibratedRectFromCorners() {
+        val tl = topLeftCornerParams ?: return
+        val br = bottomRightCornerParams ?: return
+        val half = dp(22)
+        val x1 = tl.x + half
+        val y1 = tl.y + half
+        val x2 = br.x + half
+        val y2 = br.y + half
+
+        val left = min(x1, x2)
+        val top = min(y1, y2)
+        val w = max(120, abs(x2 - x1))
+        val h = max(70, abs(y2 - y1))
+
+        val rect = Rect(left, top, w, h)
+        saveCalibration(rect)
+        overlayView?.setAnalysis(
+            AnalysisResult(rect, null, emptyList(), null, null, Color.CYAN, "Калибровка стола")
+        )
+    }
+
+    // --- Ручной прицел ---
     @SuppressLint("ClickableViewAccessibility")
     private fun setupManualHandles() {
         val handleSize = dp(42)
@@ -365,7 +513,7 @@ class CaptureService : Service() {
     private fun createHandleCircle(fillHex: String, strokeHex: String): View {
         return object : View(this) {
             private val outerRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(55, 0, 229, 255)
+                color = Color.argb(60, 0, 229, 255)
                 style = Paint.Style.FILL
             }
             private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -383,7 +531,7 @@ class CaptureService : Service() {
                 val cy = height / 2f
                 canvas.drawCircle(cx, cy, width / 2f - dp(2), outerRing)
                 canvas.drawCircle(cx, cy, dp(12).toFloat(), stroke)
-                canvas.drawCircle(cx, cy, dp(3).toFloat(), centerDot)
+                canvas.drawCircle(cx, cy, dp(3.5f).toFloat(), centerDot)
             }
         }
     }
@@ -420,6 +568,7 @@ class CaptureService : Service() {
         manualMode = enabled
         val wm = windowManager ?: return
         if (enabled) {
+            if (calibrationMode) setCalibrationModeEnabled(false)
             resetManualHandlesToCenter()
             try {
                 wm.addView(cueHandleView, cueHandleParams)
@@ -430,24 +579,17 @@ class CaptureService : Service() {
         } else {
             try { wm.removeView(cueHandleView) } catch (_: Exception) {}
             try { wm.removeView(aimHandleView) } catch (_: Exception) {}
-            statusTextView?.text = "Поиск стола и шаров..."
+            statusTextView?.text = "Авто Ray-Cast | Сила: ${vision.cueForceLevel}/11"
         }
     }
 
     private fun resetManualHandlesToCenter() {
         val half = dp(21)
-        val table = vision.lastDetectedTable
-        if (table != null && table.width > 100 && table.height > 80) {
-            cueHandleParams?.x = (table.x + table.width / 3) - half
-            cueHandleParams?.y = (table.y + table.height / 2) - half
-            aimHandleParams?.x = (table.x + (table.width * 2) / 3) - half
-            aimHandleParams?.y = (table.y + table.height / 3) - half
-        } else {
-            cueHandleParams?.x = (screenWidth / 3) - half
-            cueHandleParams?.y = (screenHeight / 2) - half
-            aimHandleParams?.x = ((screenWidth * 2) / 3) - half
-            aimHandleParams?.y = (screenHeight / 2) - half
-        }
+        val table = vision.getActiveTableRect(screenWidth, screenHeight)
+        cueHandleParams?.x = (table.x + table.width / 3) - half
+        cueHandleParams?.y = (table.y + table.height / 2) - half
+        aimHandleParams?.x = (table.x + (table.width * 2) / 3) - half
+        aimHandleParams?.y = (table.y + table.height / 3) - half
         try {
             windowManager?.updateViewLayout(cueHandleView, cueHandleParams)
             windowManager?.updateViewLayout(aimHandleView, aimHandleParams)
@@ -470,25 +612,15 @@ class CaptureService : Service() {
         val dx = vx / len
         val dy = vy / len
 
-        val table = vision.lastDetectedTable ?: Rect(
-            (screenWidth * 0.165).toInt(),
-            (screenHeight * 0.18).toInt(),
-            (screenWidth * 0.67).toInt(),
-            (screenHeight * 0.68).toInt()
-        )
+        val table = vision.getActiveTableRect(screenWidth, screenHeight)
         val ballRadius = (table.width / 38.0).coerceIn(10.0, 32.0)
 
-        val physics = vision.tracePhysics(
-            cueX, cueY, dx, dy,
-            emptyList(),
-            table,
-            ballRadius
-        )
+        val segments = vision.traceManual(cueX, cueY, dx, dy, table, ballRadius)
         overlayView?.setAnalysis(
             AnalysisResult(
                 table = table,
-                balls = emptyList(),
-                trajectory = physics.first,
+                cueBall = null,
+                trajectory = segments,
                 ghost = null,
                 targetVector = null,
                 targetColor = Color.CYAN,
@@ -626,27 +758,26 @@ class CaptureService : Service() {
         topRow.addView(closeBtn)
 
         statusTextView = TextView(this).apply {
-            text = "Поиск стола..."
+            text = "Авто Ray-Cast активен"
             textSize = 11f
             setTextColor(Color.parseColor("#94A3B8"))
             setPadding(0, dp(2), 0, dp(10))
         }
 
-        val modeBtn = createMiniToggle("Режим: АВТО (Цвета шаров)", true) { view, isAuto ->
+        val modeBtn = createMiniToggle("Режим: АВТО (Ray-Cast)", true) { view, isAuto ->
             setManualModeEnabled(!isAuto)
-            view.text = if (isAuto) "Режим: АВТО (Цвета шаров)" else "Режим: РУЧНОЙ (Маркеры)"
+            view.text = if (isAuto) "Режим: АВТО (Ray-Cast)" else "Режим: РУЧНОЙ (Маркеры)"
+        }
+
+        val calibBtn = createMiniToggle("Калибровка стола: ВЫКЛ", false) { view, active ->
+            setCalibrationModeEnabled(active)
+            view.text = if (active) "Калибровка стола: ГОТОВО" else "Калибровка стола: ВЫКЛ"
         }
 
         val toggleOverlayBtn = createMiniToggle("Оверлей: ВКЛ", true) { view, active ->
             overlayView?.overlayEnabled = active
             overlayView?.postInvalidate()
             view.text = if (active) "Оверлей: ВКЛ" else "Оверлей: ВЫКЛ"
-        }
-
-        val toggleBallsBtn = createMiniToggle("Цвета шаров: ВКЛ", true) { view, active ->
-            overlayView?.showBallMarkers = active
-            overlayView?.postInvalidate()
-            view.text = if (active) "Цвета шаров: ВКЛ" else "Цвета шаров: ВЫКЛ"
         }
 
         // Регулятор силы кия (11 уровней: 1..11)
@@ -756,15 +887,15 @@ class CaptureService : Service() {
         card.addView(topRow)
         card.addView(statusTextView)
         card.addView(modeBtn)
+        card.addView(calibBtn)
         card.addView(toggleOverlayBtn)
-        card.addView(toggleBallsBtn)
         card.addView(forceRow)
         card.addView(bouncesBtn)
         card.addView(exitBtn)
 
         menuView = card
         menuParams = WindowManager.LayoutParams(
-            dp(235),
+            dp(240),
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -797,14 +928,14 @@ class CaptureService : Service() {
     private fun updateMenuPosition() {
         val bParams = bubbleParams ?: return
         val mParams = menuParams ?: return
-        val menuW = dp(235)
+        val menuW = dp(240)
         val bubbleW = dp(48)
         mParams.x = if (bParams.x + bubbleW + menuW + dp(12) < screenWidth) {
             bParams.x + bubbleW + dp(8)
         } else {
             (bParams.x - menuW - dp(8)).coerceAtLeast(dp(8))
         }
-        mParams.y = bParams.y.coerceIn(dp(12), (screenHeight - dp(310)).coerceAtLeast(dp(12)))
+        mParams.y = bParams.y.coerceIn(dp(12), (screenHeight - dp(320)).coerceAtLeast(dp(12)))
         if (isMenuOpen) {
             try { windowManager?.updateViewLayout(menuView, mParams) } catch (_: Exception) {}
         }
@@ -904,6 +1035,10 @@ class CaptureService : Service() {
         imageReader = null
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
+        try { if (calibrationMode) windowManager?.removeView(topLeftCornerView) } catch (_: Exception) {}
+        try { if (calibrationMode) windowManager?.removeView(bottomRightCornerView) } catch (_: Exception) {}
+        topLeftCornerView = null
+        bottomRightCornerView = null
         try { if (manualMode) windowManager?.removeView(cueHandleView) } catch (_: Exception) {}
         try { if (manualMode) windowManager?.removeView(aimHandleView) } catch (_: Exception) {}
         cueHandleView = null
