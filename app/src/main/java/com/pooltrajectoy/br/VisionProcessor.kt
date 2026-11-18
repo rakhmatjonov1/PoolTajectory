@@ -122,7 +122,11 @@ class VisionProcessor {
 
             val cue = found.firstOrNull { it.cue }
             val objects = found.filterNot { it.cue }
-            val aim = if (cue != null) detectAimLine(roi, cue.x - table.x, cue.y - table.y) else null
+            val aim = if (cue != null) {
+                detectAimLine(roi, (cue.x - table.x).toDouble(), (cue.y - table.y).toDouble())
+            } else {
+                null
+            }
 
             var trajectory = emptyList<Segment>()
             var ghost: BallPoint? = null
