@@ -3,17 +3,36 @@ package com.pooltrajectory.br
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.view.View
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
 
 class TrajectoryOverlayView(context: Context) : View(context) {
     @Volatile private var result = AnalysisResult(null, emptyList(), emptyList(), null, null, "Ожидание")
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+
+    @Volatile var overlayEnabled: Boolean = true
+    @Volatile var showTableAndBalls: Boolean = true
+    @Volatile var lineThickness: Float = 4.0f
+
+    private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 3.5f
         strokeCap = Paint.Cap.ROUND
     }
+
+    private val corePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+
+    private val dashEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
 
     fun setAnalysis(value: AnalysisResult) {
         result = value
@@ -22,52 +41,83 @@ class TrajectoryOverlayView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        if (!overlayEnabled) return
+
         val data = result
-        data.table?.let {
-            paint.color = Color.argb(190, 40, 220, 120)
-            paint.strokeWidth = 3f
-            canvas.drawRect(it.x.toFloat(), it.y.toFloat(), (it.x + it.width).toFloat(), (it.y + it.height).toFloat(), paint)
-        }
-        data.balls.forEach { ball ->
-            paint.color = if (ball.cue) Color.WHITE else Color.YELLOW
-            paint.strokeWidth = 3f
-            canvas.drawCircle(ball.x, ball.y, ball.radius, paint)
-        }
-        data.trajectory.forEach { segment ->
-            paint.color = Color.CYAN
-            paint.strokeWidth = 4f
-            if (segment.dashed) {
-                paint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(12f, 9f), 0f)
-            } else {
-                paint.pathEffect = null
+
+        if (showTableAndBalls) {
+            data.table?.let {
+                corePaint.pathEffect = null
+                corePaint.color = Color.argb(110, 0, 230, 118)
+                corePaint.strokeWidth = 2.5f
+                canvas.drawRoundRect(
+                    it.x.toFloat(), it.y.toFloat(),
+                    (it.x + it.width).toFloat(), (it.y + it.height).toFloat(),
+                    12f, 12f, corePaint
+                )
             }
-            canvas.drawLine(segment.x1, segment.y1, segment.x2, segment.y2, paint)
+
+            data.balls.forEach { ball ->
+                corePaint.pathEffect = null
+                corePaint.color = if (ball.cue) Color.argb(210, 255, 255, 255) else Color.argb(180, 255, 214, 0)
+                corePaint.strokeWidth = 2.5f
+                canvas.drawCircle(ball.x, ball.y, ball.radius, corePaint)
+            }
         }
-        paint.pathEffect = null
+
+        data.trajectory.forEach { segment ->
+            val effect = if (segment.dashed) dashEffect else null
+
+            glowPaint.pathEffect = effect
+            glowPaint.color = Color.argb(75, 0, 229, 255)
+            glowPaint.strokeWidth = lineThickness * 2.6f
+            canvas.drawLine(segment.x1, segment.y1, segment.x2, segment.y2, glowPaint)
+
+            corePaint.pathEffect = effect
+            corePaint.color = Color.parseColor("#00E5FF")
+            corePaint.strokeWidth = lineThickness
+            canvas.drawLine(segment.x1, segment.y1, segment.x2, segment.y2, corePaint)
+        }
+
+        glowPaint.pathEffect = null
+        corePaint.pathEffect = null
+
         data.ghost?.let {
-            paint.color = Color.WHITE
-            paint.strokeWidth = 2.5f
-            canvas.drawCircle(it.x, it.y, it.radius, paint)
+            fillPaint.color = Color.argb(45, 255, 255, 255)
+            canvas.drawCircle(it.x, it.y, it.radius, fillPaint)
+
+            corePaint.color = Color.WHITE
+            corePaint.strokeWidth = 2.5f
+            canvas.drawCircle(it.x, it.y, it.radius, corePaint)
+
+            fillPaint.color = Color.parseColor("#00E5FF")
+            canvas.drawCircle(it.x, it.y, 4f, fillPaint)
         }
+
         data.targetVector?.let {
-            paint.color = Color.rgb(255, 90, 40)
-            paint.strokeWidth = 4f
-            canvas.drawLine(it.x1, it.y1, it.x2, it.y2, paint)
-            val angle = kotlin.math.atan2((it.y2 - it.y1).toDouble(), (it.x2 - it.x1).toDouble())
-            val size = 16f
+            glowPaint.color = Color.argb(80, 255, 61, 0)
+            glowPaint.strokeWidth = lineThickness * 2.5f
+            canvas.drawLine(it.x1, it.y1, it.x2, it.y2, glowPaint)
+
+            corePaint.color = Color.parseColor("#FF5252")
+            corePaint.strokeWidth = lineThickness + 0.5f
+            canvas.drawLine(it.x1, it.y1, it.x2, it.y2, corePaint)
+
+            val angle = atan2((it.y2 - it.y1).toDouble(), (it.x2 - it.x1).toDouble())
+            val size = 16f + lineThickness
             val path = Path().apply {
                 moveTo(it.x2, it.y2)
                 lineTo(
-                    it.x2 - size * kotlin.math.cos(angle - 0.55).toFloat(),
-                    it.y2 - size * kotlin.math.sin(angle - 0.55).toFloat()
+                    it.x2 - size * cos(angle - 0.50).toFloat(),
+                    it.y2 - size * sin(angle - 0.50).toFloat()
                 )
                 moveTo(it.x2, it.y2)
                 lineTo(
-                    it.x2 - size * kotlin.math.cos(angle + 0.55).toFloat(),
-                    it.y2 - size * kotlin.math.sin(angle + 0.55).toFloat()
+                    it.x2 - size * cos(angle + 0.50).toFloat(),
+                    it.y2 - size * sin(angle + 0.50).toFloat()
                 )
             }
-            canvas.drawPath(path, paint)
+            canvas.drawPath(path, corePaint)
         }
     }
 }
