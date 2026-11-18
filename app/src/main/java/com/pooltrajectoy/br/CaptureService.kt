@@ -108,7 +108,7 @@ class CaptureService : Service() {
             try {
                 val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cb.setPrimaryClip(ClipData.newPlainText("HUD Crash", trace))
-                Toast.makeText(this, "Ошибка скопирована в буфер: ${e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Ошибка скопирована: ${e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
             } catch (_: Exception) {}
         }
         stopCapture()
@@ -218,7 +218,6 @@ class CaptureService : Service() {
         val width = screenWidth.coerceAtLeast(1)
         val height = screenHeight.coerceAtLeast(1)
 
-        // Создаём новый ImageReader под актуальное разрешение (портрет или альбом)
         val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         newReader.setOnImageAvailableListener({ reader ->
             if (manualMode) {
@@ -265,7 +264,6 @@ class CaptureService : Service() {
 
         val existingDisplay = virtualDisplay
         if (existingDisplay == null) {
-            // Первый запуск: создаём VirtualDisplay ровно один раз (требование Android 14/15)
             virtualDisplay = proj.createVirtualDisplay(
                 "PoolTrajectoryDisplay",
                 width,
@@ -277,7 +275,6 @@ class CaptureService : Service() {
                 workerHandler
             )
         } else {
-            // Поворот экрана: обновляем размеры и Surface без повторного createVirtualDisplay
             existingDisplay.resize(width, height, screenDensity)
             existingDisplay.setSurface(newReader.surface)
         }
@@ -334,7 +331,7 @@ class CaptureService : Service() {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setupManualHandles() {
-        val handleSize = dp(40)
+        val handleSize = dp(42)
 
         cueHandleParams = WindowManager.LayoutParams(
             handleSize, handleSize, overlayType(),
@@ -368,7 +365,7 @@ class CaptureService : Service() {
     private fun createHandleCircle(fillHex: String, strokeHex: String): View {
         return object : View(this) {
             private val outerRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(65, 0, 229, 255)
+                color = Color.argb(55, 0, 229, 255)
                 style = Paint.Style.FILL
             }
             private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -385,8 +382,8 @@ class CaptureService : Service() {
                 val cx = width / 2f
                 val cy = height / 2f
                 canvas.drawCircle(cx, cy, width / 2f - dp(2), outerRing)
-                canvas.drawCircle(cx, cy, dp(11).toFloat(), stroke)
-                canvas.drawCircle(cx, cy, dp(4).toFloat(), centerDot)
+                canvas.drawCircle(cx, cy, dp(12).toFloat(), stroke)
+                canvas.drawCircle(cx, cy, dp(3).toFloat(), centerDot)
             }
         }
     }
@@ -438,7 +435,7 @@ class CaptureService : Service() {
     }
 
     private fun resetManualHandlesToCenter() {
-        val half = dp(20)
+        val half = dp(21)
         val table = vision.lastDetectedTable
         if (table != null && table.width > 100 && table.height > 80) {
             cueHandleParams?.x = (table.x + table.width / 3) - half
@@ -460,7 +457,7 @@ class CaptureService : Service() {
     private fun recalculateManualTrajectory() {
         val cParams = cueHandleParams ?: return
         val aParams = aimHandleParams ?: return
-        val half = dp(20)
+        val half = dp(21)
 
         val cueX = (cParams.x + half).toDouble()
         val cueY = (cParams.y + half).toDouble()
@@ -474,16 +471,17 @@ class CaptureService : Service() {
         val dy = vy / len
 
         val table = vision.lastDetectedTable ?: Rect(
-            (screenWidth * 0.16).toInt(),
+            (screenWidth * 0.165).toInt(),
             (screenHeight * 0.18).toInt(),
-            (screenWidth * 0.68).toInt(),
+            (screenWidth * 0.67).toInt(),
             (screenHeight * 0.68).toInt()
         )
         val ballRadius = (table.width / 38.0).coerceIn(10.0, 32.0)
 
+        // В ручном режиме передаём emptyList() вместо шаров, чтобы убрать ложные препятствия
         val physics = vision.tracePhysics(
             cueX, cueY, dx, dy,
-            vision.lastDetectedBalls.filterNot { it.cue },
+            emptyList(),
             table,
             ballRadius
         )
@@ -492,8 +490,8 @@ class CaptureService : Service() {
                 table = table,
                 balls = emptyList(),
                 trajectory = physics.first,
-                ghost = physics.second,
-                targetVector = physics.third,
+                ghost = null,
+                targetVector = null,
                 status = "Ручной режим"
             )
         )
@@ -645,16 +643,17 @@ class CaptureService : Service() {
             view.text = if (active) "Оверлей: ВКЛ" else "Оверлей: ВЫКЛ"
         }
 
-        val toggleBoxesBtn = createMiniToggle("Контуры стола: ВКЛ", true) { view, active ->
-            overlayView?.showTableAndBalls = active
+        val toggleBoxesBtn = createMiniToggle("Контуры (Отладка): ВЫКЛ", false) { view, active ->
+            overlayView?.showDebugContours = active
             overlayView?.postInvalidate()
-            view.text = if (active) "Контуры стола: ВКЛ" else "Контуры стола: ВЫКЛ"
+            view.text = if (active) "Контуры (Отладка): ВКЛ" else "Контуры (Отладка): ВЫКЛ"
         }
 
-        val bouncesBtn = createMiniChip("Отскоки от борта: 2") { view ->
+        val bouncesBtn = createMiniChip("Отскоки от борта: 3") { view ->
             val next = when (vision.maxBounces) {
                 1 -> 2
                 2 -> 3
+                3 -> 4
                 else -> 1
             }
             vision.maxBounces = next
@@ -663,11 +662,11 @@ class CaptureService : Service() {
         }
 
         val widthBtn = createMiniChip("Толщина луча: Средняя") { view ->
-            val current = overlayView?.lineThickness ?: 4.0f
+            val current = overlayView?.lineThickness ?: 3.2f
             val (nextVal, label) = when {
-                current < 3.5f -> 4.0f to "Средняя"
-                current < 5.0f -> 6.0f to "Жирная"
-                else -> 2.5f to "Тонкая"
+                current < 3.0f -> 3.2f to "Средняя"
+                current < 4.5f -> 5.0f to "Жирная"
+                else -> 2.0f to "Тонкая"
             }
             overlayView?.lineThickness = nextVal
             overlayView?.postInvalidate()
