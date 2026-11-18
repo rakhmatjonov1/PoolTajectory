@@ -5,6 +5,8 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -26,6 +28,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
@@ -33,6 +36,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
@@ -66,7 +70,6 @@ class CaptureService : Service() {
     private var menuParams: WindowManager.LayoutParams? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
 
-    // Ручные перетаскиваемые маркеры (Биток и Прицел)
     private var cueHandleView: View? = null
     private var aimHandleView: View? = null
     private var cueHandleParams: WindowManager.LayoutParams? = null
@@ -94,6 +97,23 @@ class CaptureService : Service() {
         return START_NOT_STICKY
     }
 
+    private fun reportErrorAndStop(e: Throwable) {
+        val trace = e.stackTraceToString()
+        getSharedPreferences("hud_logs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("last_crash", trace)
+            .apply()
+
+        Handler(Looper.getMainLooper()).post {
+            try {
+                val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cb.setPrimaryClip(ClipData.newPlainText("HUD Crash", trace))
+                Toast.makeText(this, "Ошибка скопирована в буфер: ${e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+            } catch (_: Exception) {}
+        }
+        stopCapture()
+    }
+
     private fun startCapture(intent: Intent) {
         try {
             createNotificationChannel()
@@ -108,7 +128,7 @@ class CaptureService : Service() {
             }
 
             if (!OpenCVLoader.initLocal()) {
-                stopSelf()
+                reportErrorAndStop(IllegalStateException("OpenCVLoader.initLocal() вернул false"))
                 return
             }
 
@@ -132,7 +152,6 @@ class CaptureService : Service() {
             workerThread = HandlerThread("PoolTrajectoryCV").also { it.start() }
             workerHandler = Handler(workerThread!!.looper)
 
-            // Android 14+: колбэк обязательно регистрируется ДО createVirtualDisplay
             projection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
                     stopCapture()
@@ -143,8 +162,8 @@ class CaptureService : Service() {
             setupFloatingControls()
             setupManualHandles()
             createOrResizeProjection()
-        } catch (_: Exception) {
-            stopCapture()
+        } catch (t: Throwable) {
+            reportErrorAndStop(t)
         }
     }
 
@@ -167,13 +186,16 @@ class CaptureService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        val oldW = screenWidth
-        val oldH = screenHeight
-        updateDisplayMetrics()
-        if (oldW != screenWidth || oldH != screenHeight) {
-            // При повороте экрана (Портрет <-> Альбом) пересоздаём VirtualDisplay под новые размеры
-            createOrResizeProjection()
-            repositionFloatingElementsAfterRotation()
+        try {
+            val oldW = screenWidth
+            val oldH = screenHeight
+            updateDisplayMetrics()
+            if (oldW != screenWidth || oldH != screenHeight) {
+                createOrResizeProjection()
+                repositionFloatingElementsAfterRotation()
+            }
+        } catch (t: Throwable) {
+            reportErrorAndStop(t)
         }
     }
 
@@ -196,12 +218,9 @@ class CaptureService : Service() {
         val width = screenWidth.coerceAtLeast(1)
         val height = screenHeight.coerceAtLeast(1)
 
-        try { virtualDisplay?.release() } catch (_: Exception) {}
-        try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
-        try { imageReader?.close() } catch (_: Exception) {}
-
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        imageReader?.setOnImageAvailableListener({ reader ->
+        // Создаём новый ImageReader под актуальное разрешение (портрет или альбом)
+        val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        newReader.setOnImageAvailableListener({ reader ->
             if (manualMode) {
                 try { reader.acquireLatestImage()?.close() } catch (_: Exception) {}
                 return@setOnImageAvailableListener
@@ -234,23 +253,37 @@ class CaptureService : Service() {
                         bitmap.recycle()
                     }
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             } finally {
                 try { image?.close() } catch (_: Exception) {}
                 processing.set(false)
             }
         }, workerHandler)
 
-        virtualDisplay = proj.createVirtualDisplay(
-            "PoolTrajectoryDisplay",
-            width,
-            height,
-            screenDensity,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface,
-            null,
-            workerHandler
-        )
+        val oldReader = imageReader
+        imageReader = newReader
+
+        val existingDisplay = virtualDisplay
+        if (existingDisplay == null) {
+            // Первый запуск: создаём VirtualDisplay ровно один раз (требование Android 14/15)
+            virtualDisplay = proj.createVirtualDisplay(
+                "PoolTrajectoryDisplay",
+                width,
+                height,
+                screenDensity,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                newReader.surface,
+                null,
+                workerHandler
+            )
+        } else {
+            // Поворот экрана: обновляем размеры и Surface без повторного createVirtualDisplay
+            existingDisplay.resize(width, height, screenDensity)
+            existingDisplay.setSurface(newReader.surface)
+        }
+
+        try { oldReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
+        try { oldReader?.close() } catch (_: Exception) {}
     }
 
     private fun imageToBitmap(image: Image): Bitmap? {
@@ -267,7 +300,7 @@ class CaptureService : Service() {
             val cropped = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
             padded.recycle()
             cropped
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
     }
@@ -440,7 +473,6 @@ class CaptureService : Service() {
         val dx = vx / len
         val dy = vy / len
 
-        // Используем границы стола от OpenCV, если стол найден, иначе стандартные пропорции игрового поля
         val table = vision.lastDetectedTable ?: Rect(
             (screenWidth * 0.16).toInt(),
             (screenHeight * 0.18).toInt(),
@@ -602,7 +634,6 @@ class CaptureService : Service() {
             setPadding(0, dp(2), 0, dp(10))
         }
 
-        // Переключатель режима: АВТО (OpenCV) / РУЧНОЙ (Маркеры)
         val modeBtn = createMiniToggle("Режим: АВТО (OpenCV)", true) { view, isAuto ->
             setManualModeEnabled(!isAuto)
             view.text = if (isAuto) "Режим: АВТО (OpenCV)" else "Режим: РУЧНОЙ (Маркеры)"
@@ -808,31 +839,4 @@ class CaptureService : Service() {
     private fun stopCapture() {
         if (!stopping.compareAndSet(false, true)) return
         try { virtualDisplay?.release() } catch (_: Exception) {}
-        virtualDisplay = null
-        try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
-        try { imageReader?.close() } catch (_: Exception) {}
-        imageReader = null
-        try { projection?.stop() } catch (_: Exception) {}
-        projection = null
-        try { if (manualMode) windowManager?.removeView(cueHandleView) } catch (_: Exception) {}
-        try { if (manualMode) windowManager?.removeView(aimHandleView) } catch (_: Exception) {}
-        cueHandleView = null
-        aimHandleView = null
-        try { if (isMenuOpen) menuView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
-        menuView = null
-        try { bubbleView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
-        bubbleView = null
-        try { overlayView?.let { windowManager?.removeView(it) } } catch (_: Exception) {}
-        overlayView = null
-        try { workerThread?.quitSafely() } catch (_: Exception) {}
-        workerThread = null
-        workerHandler = null
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-    }
-
-    override fun onDestroy() {
-        stopCapture()
-        super.onDestroy()
-    }
-}
+        virtualDisplay
