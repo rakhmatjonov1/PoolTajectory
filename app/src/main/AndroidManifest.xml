@@ -1,18 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
-        android:allowBackup="false"
-        android:label="PoolTrajectory BR"
-        android:theme="@style/AppTheme"
-        android:usesCleartextTraffic="false">
+        android:allowBackup="true"
+        android:label="PoolTrajectory HUD"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -21,7 +24,9 @@
 
         <service
             android:name=".CaptureService"
+            android:enabled="true"
             android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout"
             android:foregroundServiceType="mediaProjection" />
     </application>
 </manifest>
