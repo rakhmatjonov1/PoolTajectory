@@ -26,7 +26,7 @@ data class AnalysisResult(
 
 class VisionProcessor {
     private val ballRadius = 14.0
-    private val maxBounces = 2
+    @Volatile var maxBounces = 2
 
     fun analyze(rgba: Mat): AnalysisResult {
         if (rgba.empty() || rgba.cols() < 10 || rgba.rows() < 10) {
@@ -143,12 +143,12 @@ class VisionProcessor {
 
             val status = when {
                 cue == null -> "Биток не найден"
-                aim == null -> "Линия прицеливания не найдена"
-                else -> "Анализ активен"
+                aim == null -> "Прицел не найден"
+                else -> "Траектория активна"
             }
             return AnalysisResult(table, found, trajectory, ghost, targetVector, status)
         } catch (e: Exception) {
-            return AnalysisResult(null, emptyList(), emptyList(), null, null, "Ошибка анализа кадра")
+            return AnalysisResult(null, emptyList(), emptyList(), null, null, "Ошибка кадра")
         } finally {
             releaseAll(bgr, hsv, mask, green, blue, kernel, roi, roiGray, roiHsv, maskRoi, inverse, circles)
         }
@@ -211,8 +211,9 @@ class VisionProcessor {
         var y = startY
         var dx = dx0
         var dy = dy0
+        val currentMaxBounces = maxBounces
 
-        for (bounceCount in 0..maxBounces) {
+        for (bounceCount in 0..currentMaxBounces) {
             val inset = ballRadius
             val left = table.x + inset
             val right = table.x + table.width - inset
@@ -281,7 +282,7 @@ class VisionProcessor {
             val hy = y + dy * wallT
             segments.add(Segment(x.toFloat(), y.toFloat(), hx.toFloat(), hy.toFloat(), bounceCount > 0))
 
-            if (bounceCount >= maxBounces) break
+            if (bounceCount >= currentMaxBounces) break
 
             val dot = dx * nx + dy * ny
             dx -= 2.0 * dot * nx
