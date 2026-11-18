@@ -2,6 +2,7 @@ package com.pooltrajectory.br
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -23,9 +24,22 @@ class MainActivity : AppCompatActivity() {
     private val captureRequestCode = 4101
     private lateinit var projectionManager: MediaProjectionManager
     private lateinit var overlayStatusBadge: TextView
+    private lateinit var crashLogText: TextView
+    private lateinit var crashCard: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Глобальный перехватчик любых крашей для диагностики
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            getSharedPreferences("hud_logs", Context.MODE_PRIVATE)
+                .edit()
+                .putString("last_crash", throwable.stackTraceToString())
+                .commit()
+            defaultHandler?.uncaughtException(thread, throwable)
+        }
+
         projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         val rootScroll = ScrollView(this).apply {
@@ -76,6 +90,48 @@ class MainActivity : AppCompatActivity() {
             setLineSpacing(dp(3).toFloat(), 1f)
         }
 
+        // Карточка лога сбоя (появляется только если был краш)
+        crashCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = createRoundBox("#2A1219", "#FF5252", 1, 14)
+            visibility = View.GONE
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(16) }
+            layoutParams = params
+        }
+
+        val crashTitle = TextView(this).apply {
+            text = "Обнаружен лог последнего сбоя:"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#FF8A80"))
+        }
+
+        crashLogText = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.parseColor("#FFCDD2"))
+            setPadding(0, dp(6), 0, dp(10))
+            maxLines = 8
+        }
+
+        val clearLogBtn = createActionButton(
+            text = "ОЧИСТИТЬ ЛОГ",
+            bgHex = "#3D1822",
+            strokeHex = "#7A293D",
+            textHex = "#FFCDD2"
+        ) {
+            getSharedPreferences("hud_logs", Context.MODE_PRIVATE).edit().remove("last_crash").apply()
+            crashCard.visibility = View.GONE
+        }
+
+        crashCard.addView(crashTitle)
+        crashCard.addView(crashLogText)
+        crashCard.addView(clearLogBtn)
+
+        // Карточка разрешений
         val statusCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(18), dp(18), dp(18))
@@ -129,6 +185,7 @@ class MainActivity : AppCompatActivity() {
         statusCard.addView(statusDesc)
         statusCard.addView(permBtn)
 
+        // Карточка запуска
         val controlCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(18), dp(18), dp(18))
@@ -183,6 +240,7 @@ class MainActivity : AppCompatActivity() {
 
         container.addView(headerRow)
         container.addView(subtitle)
+        container.addView(crashCard)
         container.addView(statusCard)
         container.addView(controlCard)
 
@@ -193,6 +251,11 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updatePermissionBadge()
+        val lastCrash = getSharedPreferences("hud_logs", Context.MODE_PRIVATE).getString("last_crash", null)
+        if (!lastCrash.isNullOrBlank()) {
+            crashLogText.text = lastCrash.take(600)
+            crashCard.visibility = View.VISIBLE
+        }
     }
 
     private fun updatePermissionBadge() {
