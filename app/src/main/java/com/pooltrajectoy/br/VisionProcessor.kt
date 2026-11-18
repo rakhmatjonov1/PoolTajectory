@@ -45,12 +45,11 @@ class VisionProcessor {
     @Volatile var cueForceLevel = 7 // 1..11
     @Volatile var calibratedTableRect: Rect? = null
 
-    /**
-     * Комбинированный конвейер:
-     * 1. Жёсткая геометрия стола (из калибровки или безопасных пропорций).
-     * 2. Вычитание размытого фона (absdiff) — работает на любом цвете стола (синий, зелёный, фиолетовый).
-     * 3. Ray-Cast Vision — поиск препятствий только вдоль луча удара без лишних кругов на столе.
-     */
+    // Память последней подтверждённой позиции битка (чтобы не терять его при движении кия)
+    private var lastCueSmallX: Double = -1.0
+    private var lastCueSmallY: Double = -1.0
+    private var cueLostFrames: Int = 0
+
     fun analyze(rgbaFull: Mat): AnalysisResult {
         if (rgbaFull.empty() || rgbaFull.cols() < 40 || rgbaFull.rows() < 40) {
             return AnalysisResult(null, null, emptyList(), null, null, Color.CYAN, "Нет кадра")
@@ -73,7 +72,6 @@ class VisionProcessor {
             (tableFull.width * scale).toInt().coerceAtLeast(20),
             (tableFull.height * scale).toInt().coerceAtLeast(20)
         )
-        // Защита от выхода за границы кадра
         if (tableSmall.x + tableSmall.width > (fullW * scale).toInt()) {
             tableSmall.width = (fullW * scale).toInt() - tableSmall.x
         }
@@ -85,11 +83,11 @@ class VisionProcessor {
         val bgrSmall = Mat()
         var roiBgr: Mat? = null
         val roiHsv = Mat()
-        val roiGray = Mat()
         val blurredBg = Mat()
         val diffMap = Mat()
         val foregroundMask = Mat()
         val whiteMask = Mat()
+        val cueCoreMask = Mat()
 
         try {
             Imgproc.resize(rgbaFull, rgbaSmall, Size(), scale, scale, Imgproc.INTER_LINEAR)
@@ -97,31 +95,57 @@ class VisionProcessor {
 
             roiBgr = Mat(bgrSmall, tableSmall)
             Imgproc.cvtColor(roiBgr, roiHsv, Imgproc.COLOR_BGR2HSV)
-            Imgproc.cvtColor(roiBgr, roiGray, Imgproc.COLOR_BGR2GRAY)
 
             val ballRadiusSmall = (tableSmall.width / 38.0).coerceIn(5.0, 24.0)
 
-            // --- ВАРИАНТ 1: Вычитание размытого фона (не зависит от цвета сукна и виньетки) ---
+            // 1. Вычитание размытого фона (не зависит от цвета сукна)
             val blurSize = (ballRadiusSmall * 3.5).toInt().let { if (it % 2 == 0) it + 1 else it }.coerceIn(15, 61)
             Imgproc.GaussianBlur(roiBgr, blurredBg, Size(blurSize.toDouble(), blurSize.toDouble()), 0.0)
             Core.absdiff(roiBgr, blurredBg, diffMap)
 
             val diffGray = Mat()
             Imgproc.cvtColor(diffMap, diffGray, Imgproc.COLOR_BGR2GRAY)
-            // Порог отличия объекта от гладкого фона стола (отсекает водяной знак "8 POOL" и виньетку)
-            Imgproc.threshold(diffGray, foregroundMask, 24.0, 255.0, Imgproc.THRESH_BINARY)
+            Imgproc.threshold(diffGray, foregroundMask, 22.0, 255.0, Imgproc.THRESH_BINARY)
             diffGray.release()
 
             val cleanKernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0))
             Imgproc.morphologyEx(foregroundMask, foregroundMask, Imgproc.MORPH_OPEN, cleanKernel)
             cleanKernel.release()
 
-            // --- Поиск только белого битка ---
-            Core.inRange(roiHsv, Scalar(0.0, 0.0, 185.0), Scalar(180.0, 68.0, 255.0), whiteMask)
-            Core.bitwise_and(whiteMask, foregroundMask, whiteMask)
+            // 2. Выделяем белые области (биток + прицельная линия + белые полоски шаров)
+            Core.inRange(roiHsv, Scalar(0.0, 0.0, 175.0), Scalar(180.0, 75.0, 255.0), whiteMask)
 
-            val cueSmall = findBestCueBall(whiteMask, tableSmall.width, tableSmall.height, ballRadiusSmall)
-                ?: return AnalysisResult(tableFull, null, emptyList(), null, null, Color.CYAN, "Ищу белый биток...")
+            // 3. Морфологически стираем тонкую линию прицела (tracer) и кий:
+            // круглый элемент диаметром ~1.15 радиуса шара полностью убирает линии толщиной 2-4 px,
+            // оставляя только сплошное круглое ядро белого битка.
+            val coreDiameter = (ballRadiusSmall * 1.15).toInt().coerceAtLeast(5)
+            val coreKernel = Imgproc.getStructuringElement(
+                Imgproc.MORPH_ELLIPSE,
+                Size(coreDiameter.toDouble(), coreDiameter.toDouble())
+            )
+            Imgproc.morphologyEx(whiteMask, cueCoreMask, Imgproc.MORPH_OPEN, coreKernel)
+            coreKernel.release()
+
+            val detectedCue = findBestCueBall(cueCoreMask, tableSmall.width, tableSmall.height, ballRadiusSmall)
+
+            val cueSmall: Pair<Double, Double>? = if (detectedCue != null) {
+                lastCueSmallX = detectedCue.first
+                lastCueSmallY = detectedCue.second
+                cueLostFrames = 0
+                detectedCue
+            } else if (lastCueSmallX > 0 && lastCueSmallY > 0 && cueLostFrames < 12) {
+                // Удерживаем позицию битка до 12 кадров (~1 сек), если кий временно перекрыл шар
+                cueLostFrames++
+                Pair(lastCueSmallX, lastCueSmallY)
+            } else {
+                lastCueSmallX = -1.0
+                lastCueSmallY = -1.0
+                null
+            }
+
+            if (cueSmall == null) {
+                return AnalysisResult(tableFull, null, emptyList(), null, null, Color.CYAN, "Ищу белый биток...")
+            }
 
             val cueFull = BallPoint(
                 x = ((cueSmall.first + tableSmall.x) * invScale).toFloat(),
@@ -131,11 +155,11 @@ class VisionProcessor {
                 colorInt = Color.WHITE
             )
 
-            // --- Поиск линии прицела в локальном окне вокруг битка ---
-            val aim = detectAimLineNearCue(roiBgr, cueSmall.first, cueSmall.second, ballRadiusSmall)
-                ?: return AnalysisResult(tableFull, cueFull, emptyList(), null, null, Color.CYAN, "Наведите кий на шар")
+            // 4. Ищем направление белой линии прицела вокруг битка
+            val aim = detectAimLineFromWhiteMask(whiteMask, roiBgr, cueSmall.first, cueSmall.second, ballRadiusSmall)
+                ?: return AnalysisResult(tableFull, cueFull, emptyList(), null, null, Color.CYAN, "Биток найден | Наведите кий")
 
-            // --- ВАРИАНТ 3: Ray-Cast Vision (сканирование препятствий строго вдоль луча) ---
+            // 5. Ray-Cast сканирование препятствий строго вдоль луча
             val rayResult = traceRayCast(
                 cueSmallX = cueSmall.first,
                 cueSmallY = cueSmall.second,
@@ -151,7 +175,7 @@ class VisionProcessor {
             val status = if (rayResult.ghost != null) {
                 "Цель захвачена | Сила: $cueForceLevel/11"
             } else {
-                "Отскоки от бортов | Сила: $cueForceLevel/11"
+                "Отскоки | Сила: $cueForceLevel/11"
             }
 
             return AnalysisResult(
@@ -166,13 +190,10 @@ class VisionProcessor {
         } catch (_: Exception) {
             return AnalysisResult(tableFull, null, emptyList(), null, null, Color.CYAN, "Ошибка кадра")
         } finally {
-            releaseAll(rgbaSmall, bgrSmall, roiBgr, roiHsv, roiGray, blurredBg, diffMap, foregroundMask, whiteMask)
+            releaseAll(rgbaSmall, bgrSmall, roiBgr, roiHsv, blurredBg, diffMap, foregroundMask, whiteMask, cueCoreMask)
         }
     }
 
-    /**
-     * Возвращает откалиброванный прямоугольник стола или стандартные координаты поля в альбомном режиме
-     */
     fun getActiveTableRect(screenW: Int, screenH: Int): Rect {
         calibratedTableRect?.let {
             if (it.width > 120 && it.height > 70 && it.x >= 0 && it.y >= 0 &&
@@ -181,7 +202,6 @@ class VisionProcessor {
                 return it
             }
         }
-        // Безопасная геометрия внутреннего поля стола 8 Ball Pool по умолчанию
         val left = (screenW * 0.172).toInt()
         val top = (screenH * 0.195).toInt()
         val right = (screenW * 0.828).toInt()
@@ -190,17 +210,17 @@ class VisionProcessor {
     }
 
     /**
-     * Находит центр белого битка по плотности белых пикселей внутри круга радиуса ballR
+     * Поиск ядра белого битка после удаления тонкой линии прицела
      */
     private fun findBestCueBall(
-        whiteMask: Mat, w: Int, h: Int, ballR: Double
+        cueCoreMask: Mat, w: Int, h: Int, ballR: Double
     ): Pair<Double, Double>? {
         val integral = Mat()
-        Imgproc.integral(whiteMask, integral, CvType.CV_32S)
+        Imgproc.integral(cueCoreMask, integral, CvType.CV_32S)
 
-        val r = (ballR * 0.85).toInt().coerceAtLeast(3)
+        val r = (ballR * 0.72).toInt().coerceAtLeast(3)
         val boxArea = (2 * r + 1) * (2 * r + 1) * 255.0
-        val step = max(2, (ballR * 0.35).toInt())
+        val step = max(2, (ballR * 0.3).toInt())
 
         var bestScore = 0.0
         var bestX = -1.0
@@ -210,7 +230,6 @@ class VisionProcessor {
         val rowBot = IntArray(w + 1)
 
         for (y in r + 2 until h - r - 2 step step) {
-            if (inPocketZone(0.0, y.toDouble(), w.toDouble(), h.toDouble(), ballR)) continue
             integral.get(y - r, 0, rowTop)
             integral.get(y + r + 1, 0, rowBot)
 
@@ -220,11 +239,19 @@ class VisionProcessor {
                 val sum = rowBot[x + r + 1] - rowBot[x - r] - rowTop[x + r + 1] + rowTop[x - r]
                 val fillRatio = sum / boxArea
 
-                // Белый биток заполняет от 45% до 92% квадрата (отсекаем слишком большие белые блики и мелкий шум)
-                if (fillRatio in 0.42..0.92 && fillRatio > bestScore) {
-                    bestScore = fillRatio
-                    bestX = x.toDouble()
-                    bestY = y.toDouble()
+                if (fillRatio >= 0.35) {
+                    // Бонус за близость к предыдущей позиции битка (стабилизация)
+                    val distBonus = if (lastCueSmallX > 0) {
+                        val d = hypot(x - lastCueSmallX, y - lastCueSmallY)
+                        if (d < ballR * 1.5) 0.25 else 0.0
+                    } else 0.0
+
+                    val score = fillRatio + distBonus
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestX = x.toDouble()
+                        bestY = y.toDouble()
+                    }
                 }
             }
         }
@@ -233,26 +260,34 @@ class VisionProcessor {
         return if (bestX > 0 && bestY > 0) Pair(bestX, bestY) else null
     }
 
-    private fun detectAimLineNearCue(
-        roi: Mat, cueX: Double, cueY: Double, ballR: Double
+    /**
+     * Ищем прицельную линию по белой маске вокруг битка (игнорируя сам круг битка)
+     */
+    private fun detectAimLineFromWhiteMask(
+        whiteMask: Mat, roiBgr: Mat, cueX: Double, cueY: Double, ballR: Double
     ): Pair<Double, Double>? {
-        val searchRadius = (ballR * 12.0).toInt().coerceAtLeast(50)
-        val x0 = (cueX - searchRadius).toInt().coerceIn(0, roi.cols() - 1)
-        val y0 = (cueY - searchRadius).toInt().coerceIn(0, roi.rows() - 1)
-        val x1 = (cueX + searchRadius).toInt().coerceIn(x0 + 1, roi.cols())
-        val y1 = (cueY + searchRadius).toInt().coerceIn(y0 + 1, roi.rows())
+        val searchRadius = (ballR * 13.0).toInt().coerceAtLeast(55)
+        val x0 = (cueX - searchRadius).toInt().coerceIn(0, whiteMask.cols() - 1)
+        val y0 = (cueY - searchRadius).toInt().coerceIn(0, whiteMask.rows() - 1)
+        val x1 = (cueX + searchRadius).toInt().coerceIn(x0 + 1, whiteMask.cols())
+        val y1 = (cueY + searchRadius).toInt().coerceIn(y0 + 1, whiteMask.rows())
 
-        val localRoi = roi.submat(Rect(x0, y0, x1 - x0, y1 - y0))
+        val localWhite = whiteMask.submat(Rect(x0, y0, x1 - x0, y1 - y0)).clone()
         val localCueX = cueX - x0
         val localCueY = cueY - y0
 
-        val gray = Mat()
-        val edges = Mat()
+        // Закрашиваем сам белый биток чёрным, чтобы его края не давали ложных отрезков
+        Imgproc.circle(
+            localWhite,
+            org.opencv.core.Point(localCueX, localCueY),
+            (ballR * 1.25).toInt(),
+            Scalar(0.0),
+            -1
+        )
+
         val lines = Mat()
         return try {
-            Imgproc.cvtColor(localRoi, gray, Imgproc.COLOR_BGR2GRAY)
-            Imgproc.Canny(gray, edges, 55.0, 145.0)
-            Imgproc.HoughLinesP(edges, lines, 1.0, PI / 180.0, 18, ballR * 1.3, ballR * 1.2)
+            Imgproc.HoughLinesP(localWhite, lines, 1.0, PI / 180.0, 14, ballR * 1.2, ballR * 1.3)
 
             var best: Pair<Double, Double>? = null
             var bestScore = 0.0
@@ -262,7 +297,7 @@ class VisionProcessor {
                 val dx = lx2 - lx1
                 val dy = ly2 - ly1
                 val length = hypot(dx, dy)
-                if (length < ballR * 1.2) continue
+                if (length < ballR * 1.1) continue
 
                 val cross = abs((localCueX - lx1) * dy - (localCueY - ly1) * dx) / max(0.001, length)
                 if (cross > ballR * 0.45) continue
@@ -271,9 +306,9 @@ class VisionProcessor {
                 val uy = dy / length
                 val dist1 = hypot(localCueX - lx1, localCueY - ly1)
                 val dist2 = hypot(localCueX - lx2, localCueY - ly2)
-                if (min(dist1, dist2) > ballR * 4.5) continue
+                if (min(dist1, dist2) > ballR * 5.0) continue
 
-                val score = length - cross * 3.5
+                val score = length - cross * 3.0
                 if (score > bestScore) {
                     val sign = if (dist1 > dist2) -1.0 else 1.0
                     best = Pair(ux * sign, uy * sign)
@@ -284,8 +319,8 @@ class VisionProcessor {
         } catch (_: Exception) {
             null
         } finally {
-            localRoi.release()
-            releaseAll(gray, edges, lines)
+            localWhite.release()
+            lines.release()
         }
     }
 
@@ -296,10 +331,6 @@ class VisionProcessor {
         val targetColor: Int
     )
 
-    /**
-     * Вариант 3: Шагаем вдоль луча прицеливания и проверяем наличие препятствия
-     * в радиусе столкновения (2 * ballRadius) только на пути битка.
-     */
     private fun traceRayCast(
         cueSmallX: Double,
         cueSmallY: Double,
@@ -358,7 +389,6 @@ class VisionProcessor {
             if (!wallT.isFinite()) break
 
             val maxSegmentT = min(wallT, remainingEnergy)
-            // Начинаем сканировать после 2.1 радиуса от стартовой точки, чтобы не задеть сам биток
             val startScanT = if (bounceCount == 0) ballRadiusSmall * 2.15 else ballRadiusSmall * 0.5
             var t = startScanT
 
@@ -366,7 +396,6 @@ class VisionProcessor {
                 val testX = x + dx * t
                 val testY = y + dy * t
 
-                // Проверяем, не попадает ли точка в зону лузы
                 if (!inPocketZone(testX, testY, tableSmall.width.toDouble(), tableSmall.height.toDouble(), ballRadiusSmall)) {
                     val ix = testX.toInt()
                     val iy = testY.toInt()
@@ -375,14 +404,11 @@ class VisionProcessor {
                     ) {
                         foregroundMask.get(iy, ix, pixelBuf)
                         if (pixelBuf[0] != 0.toByte()) {
-                            // Проверяем плотность объекта в окрестности, чтобы отсечь тонкую белую линию прицела игры
                             val sub = foregroundMask.submat(Rect(ix - checkR, iy - checkR, 2 * checkR + 1, 2 * checkR + 1))
                             val density = Core.countNonZero(sub).toDouble() / patchArea
                             sub.release()
 
                             if (density > 0.52) {
-                                // Нашли реальный прицельный шар на пути луча!
-                                // Откатываем центр призрачного шара на 1.85 радиуса назад от точки касания края шара
                                 val ghostSmallX = (testX - dx * (ballRadiusSmall * 0.95))
                                 val ghostSmallY = (testY - dy * (ballRadiusSmall * 0.95))
                                 val targetSmallX = (testX + dx * (ballRadiusSmall * 0.95))
@@ -417,7 +443,6 @@ class VisionProcessor {
                 t += stepSize
             }
 
-            // Препятствий на отрезке нет — доводим луч до борта или конца энергии
             val endX = x + dx * maxSegmentT
             val endY = y + dy * maxSegmentT
 
@@ -447,9 +472,6 @@ class VisionProcessor {
         return RayCastOutput(segments, null, null, Color.parseColor("#00E5FF"))
     }
 
-    /**
-     * Определяет цвет найденного прицельного шара в точке попадания луча
-     */
     private fun sampleTargetBallColor(roiHsv: Mat, cx: Int, cy: Int, ballR: Double): Int {
         val sampleR = max(2, (ballR * 0.45).toInt())
         val x0 = (cx - sampleR).coerceIn(0, roiHsv.cols() - 1)
@@ -465,16 +487,16 @@ class VisionProcessor {
         val s = mean.`val`[1]
         val v = mean.`val`[2]
 
-        if (v < 75.0) return Color.parseColor("#B0BEC5") // 8-й шар (подсвечиваем серебристо-белым для контраста)
+        if (v < 75.0) return Color.parseColor("#B0BEC5")
         if (s < 70.0) return Color.parseColor("#00E5FF")
 
         return when {
-            h in 18.0..34.0 -> Color.parseColor("#FFD600")      // Жёлтый (1/9)
-            h in 10.0..17.9 -> Color.parseColor("#FF6D00")      // Оранжевый (5/13)
-            h < 10.0 || h > 166.0 -> Color.parseColor("#FF1744") // Красный/Бордовый (3/11, 7/15)
-            h in 38.0..86.0 -> Color.parseColor("#00E676")      // Зелёный (6/14)
-            h in 98.0..126.0 -> Color.parseColor("#2979FF")     // Синий (2/10)
-            h in 126.1..165.9 -> Color.parseColor("#D500F9")    // Фиолетовый (4/12)
+            h in 18.0..34.0 -> Color.parseColor("#FFD600")
+            h in 10.0..17.9 -> Color.parseColor("#FF6D00")
+            h < 10.0 || h > 166.0 -> Color.parseColor("#FF1744")
+            h in 38.0..86.0 -> Color.parseColor("#00E676")
+            h in 98.0..126.0 -> Color.parseColor("#2979FF")
+            h in 126.1..165.9 -> Color.parseColor("#D500F9")
             else -> Color.parseColor("#00E5FF")
         }
     }
@@ -487,9 +509,6 @@ class VisionProcessor {
         return pockets.any { hypot(x - it.first, y - it.second) < ballR * 1.9 }
     }
 
-    /**
-     * Упрощённый физический расчёт для ручного режима (маркеры без OpenCV)
-     */
     fun traceManual(
         startX: Double, startY: Double,
         dx0: Double, dy0: Double,
