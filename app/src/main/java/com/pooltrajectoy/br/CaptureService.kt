@@ -244,7 +244,7 @@ class CaptureService : Service() {
                             if (!manualMode) {
                                 overlayView?.setAnalysis(result)
                                 if (isMenuOpen) {
-                                    statusTextView?.text = "Статус: ${result.status}"
+                                    statusTextView?.text = result.status
                                 }
                             }
                         }
@@ -426,11 +426,11 @@ class CaptureService : Service() {
                 wm.addView(aimHandleView, aimHandleParams)
             } catch (_: Exception) {}
             recalculateManualTrajectory()
-            statusTextView?.text = "Статус: Ручной прицел (60 FPS)"
+            statusTextView?.text = "Ручной прицел | Сила: ${vision.cueForceLevel}/11"
         } else {
             try { wm.removeView(cueHandleView) } catch (_: Exception) {}
             try { wm.removeView(aimHandleView) } catch (_: Exception) {}
-            statusTextView?.text = "Статус: Поиск стола..."
+            statusTextView?.text = "Поиск стола и шаров..."
         }
     }
 
@@ -478,7 +478,6 @@ class CaptureService : Service() {
         )
         val ballRadius = (table.width / 38.0).coerceIn(10.0, 32.0)
 
-        // В ручном режиме передаём emptyList() вместо шаров, чтобы убрать ложные препятствия
         val physics = vision.tracePhysics(
             cueX, cueY, dx, dy,
             emptyList(),
@@ -492,6 +491,7 @@ class CaptureService : Service() {
                 trajectory = physics.first,
                 ghost = null,
                 targetVector = null,
+                targetColor = Color.CYAN,
                 status = "Ручной режим"
             )
         )
@@ -626,15 +626,15 @@ class CaptureService : Service() {
         topRow.addView(closeBtn)
 
         statusTextView = TextView(this).apply {
-            text = "Статус: Авто-поиск"
+            text = "Поиск стола..."
             textSize = 11f
             setTextColor(Color.parseColor("#94A3B8"))
             setPadding(0, dp(2), 0, dp(10))
         }
 
-        val modeBtn = createMiniToggle("Режим: АВТО (OpenCV)", true) { view, isAuto ->
+        val modeBtn = createMiniToggle("Режим: АВТО (Цвета шаров)", true) { view, isAuto ->
             setManualModeEnabled(!isAuto)
-            view.text = if (isAuto) "Режим: АВТО (OpenCV)" else "Режим: РУЧНОЙ (Маркеры)"
+            view.text = if (isAuto) "Режим: АВТО (Цвета шаров)" else "Режим: РУЧНОЙ (Маркеры)"
         }
 
         val toggleOverlayBtn = createMiniToggle("Оверлей: ВКЛ", true) { view, active ->
@@ -643,11 +643,83 @@ class CaptureService : Service() {
             view.text = if (active) "Оверлей: ВКЛ" else "Оверлей: ВЫКЛ"
         }
 
-        val toggleBoxesBtn = createMiniToggle("Контуры (Отладка): ВЫКЛ", false) { view, active ->
-            overlayView?.showDebugContours = active
+        val toggleBallsBtn = createMiniToggle("Цвета шаров: ВКЛ", true) { view, active ->
+            overlayView?.showBallMarkers = active
             overlayView?.postInvalidate()
-            view.text = if (active) "Контуры (Отладка): ВКЛ" else "Контуры (Отладка): ВЫКЛ"
+            view.text = if (active) "Цвета шаров: ВКЛ" else "Цвета шаров: ВЫКЛ"
         }
+
+        // Регулятор силы кия (11 уровней: 1..11)
+        val forceRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#18202E"))
+                setStroke(dp(1), Color.parseColor("#2A364B"))
+                cornerRadius = dp(8).toFloat()
+            }
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(6) }
+            layoutParams = params
+        }
+
+        val forceLabel = TextView(this).apply {
+            text = "Сила кия: ${vision.cueForceLevel} / 11"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#E2E8F0"))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val forceMinusBtn = TextView(this).apply {
+            text = " − "
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#00E5FF"))
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#132C3B"))
+                cornerRadius = dp(6).toFloat()
+            }
+            setOnClickListener {
+                if (vision.cueForceLevel > 1) {
+                    vision.cueForceLevel -= 1
+                    forceLabel.text = "Сила кия: ${vision.cueForceLevel} / 11"
+                    if (manualMode) recalculateManualTrajectory()
+                }
+            }
+        }
+
+        val forcePlusBtn = TextView(this).apply {
+            text = " + "
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#00E5FF"))
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#132C3B"))
+                cornerRadius = dp(6).toFloat()
+            }
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(6) }
+            layoutParams = lp
+            setOnClickListener {
+                if (vision.cueForceLevel < 11) {
+                    vision.cueForceLevel += 1
+                    forceLabel.text = "Сила кия: ${vision.cueForceLevel} / 11"
+                    if (manualMode) recalculateManualTrajectory()
+                }
+            }
+        }
+
+        forceRow.addView(forceLabel)
+        forceRow.addView(forceMinusBtn)
+        forceRow.addView(forcePlusBtn)
 
         val bouncesBtn = createMiniChip("Отскоки от борта: 3") { view ->
             val next = when (vision.maxBounces) {
@@ -659,18 +731,6 @@ class CaptureService : Service() {
             vision.maxBounces = next
             view.text = "Отскоки от борта: $next"
             if (manualMode) recalculateManualTrajectory()
-        }
-
-        val widthBtn = createMiniChip("Толщина луча: Средняя") { view ->
-            val current = overlayView?.lineThickness ?: 3.2f
-            val (nextVal, label) = when {
-                current < 3.0f -> 3.2f to "Средняя"
-                current < 4.5f -> 5.0f to "Жирная"
-                else -> 2.0f to "Тонкая"
-            }
-            overlayView?.lineThickness = nextVal
-            overlayView?.postInvalidate()
-            view.text = "Толщина луча: $label"
         }
 
         val exitBtn = TextView(this).apply {
@@ -697,14 +757,14 @@ class CaptureService : Service() {
         card.addView(statusTextView)
         card.addView(modeBtn)
         card.addView(toggleOverlayBtn)
-        card.addView(toggleBoxesBtn)
+        card.addView(toggleBallsBtn)
+        card.addView(forceRow)
         card.addView(bouncesBtn)
-        card.addView(widthBtn)
         card.addView(exitBtn)
 
         menuView = card
         menuParams = WindowManager.LayoutParams(
-            dp(225),
+            dp(235),
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -737,14 +797,14 @@ class CaptureService : Service() {
     private fun updateMenuPosition() {
         val bParams = bubbleParams ?: return
         val mParams = menuParams ?: return
-        val menuW = dp(225)
+        val menuW = dp(235)
         val bubbleW = dp(48)
         mParams.x = if (bParams.x + bubbleW + menuW + dp(12) < screenWidth) {
             bParams.x + bubbleW + dp(8)
         } else {
             (bParams.x - menuW - dp(8)).coerceAtLeast(dp(8))
         }
-        mParams.y = bParams.y.coerceIn(dp(12), (screenHeight - dp(290)).coerceAtLeast(dp(12)))
+        mParams.y = bParams.y.coerceIn(dp(12), (screenHeight - dp(310)).coerceAtLeast(dp(12)))
         if (isMenuOpen) {
             try { windowManager?.updateViewLayout(menuView, mParams) } catch (_: Exception) {}
         }
