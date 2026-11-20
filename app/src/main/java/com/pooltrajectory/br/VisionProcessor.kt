@@ -413,7 +413,7 @@ class VisionProcessor {
         return try {
             Imgproc.HoughLinesP(
             localWhite, lines, 1.0, PI / 180.0,
-            max(12.0, ballR * 0.75), ballR * 1.25, ballR * 0.9
+            max(12, (ballR * 0.75).toInt()), ballR * 1.25, ballR * 0.9
         )
 
             var best: Pair<Double, Double>? = null
